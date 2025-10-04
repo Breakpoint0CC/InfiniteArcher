@@ -1,7 +1,7 @@
 # game.py
 # Infinite Archer - Final Edition
 # Full game: menu, abilities, bow/sword, elements, knockback, waves, bosses.
-# Optional background music: place music.mp3 in same folder.
+
 
 import pygame
 import random
