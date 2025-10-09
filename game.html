@@ -1,0 +1,607 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Infinite Archer (Browser)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root { --bg:#f6f6f6; --panel-bg: rgba(255,255,255,0.95); --accent:#222; }
+  html,body{height:100%;margin:0;font-family:Inter, "Segoe UI", Roboto, sans-serif;background:var(--bg);color:#111}
+  canvas{display:block; width:100vw; height:100vh; background:var(--bg);}
+  #ui { position:fixed; left:12px; top:12px; z-index:20;
+       background:var(--panel-bg); padding:8px 12px; border-radius:8px; box-shadow:0 6px 18px rgba(0,0,0,0.12);}
+  #overlay { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; z-index:50; }
+  .menu { width:780px; max-width:94%; background:white; border-radius:12px; padding:22px; box-shadow:0 14px 60px rgba(0,0,0,0.2); text-align:center;}
+  .row{display:flex; gap:14px; justify-content:center; margin-top:16px;}
+  .btn{background:#eee; border:2px solid #444; padding:14px 18px; border-radius:10px; cursor:pointer; font-weight:700;}
+  .btn:hover{background:#e0e0e0}
+  .ability{background:#fafafa; border:1px solid #ccc; padding:12px; border-radius:8px; cursor:pointer; min-width:210px;}
+  .ability.disabled{opacity:0.5; pointer-events:none}
+  #footer{position:fixed; right:12px; bottom:12px; z-index:20; background:rgba(0,0,0,0.5); color:#fff; padding:8px 10px; border-radius:6px; font-size:13px;}
+  /* small responsive */
+  @media (max-width:640px){ .menu{ padding:14px } .btn{padding:10px;font-size:14px} .ability{min-width:140px} }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="ui">
+  Score: <span id="score">0</span>
+  &nbsp;&nbsp; Wave: <span id="wave">1</span>
+  &nbsp;&nbsp; HP: <span id="hp">100</span>
+  &nbsp;&nbsp; Dmg: <span id="dmg">20</span>
+  &nbsp;&nbsp; KB Lv: <span id="kb">1</span>
+  &nbsp;&nbsp; Weapon: <span id="weap">bow</span>
+</div>
+
+<!-- Music control (we generate music via WebAudio) -->
+<div style="position:fixed; right:12px; top:12px; z-index:20;">
+  <button id="musicToggle" class="btn" style="padding:8px 10px;font-weight:600">Music: On</button>
+</div>
+
+<div id="overlay"></div>
+<div id="footer">WASD Move · 1=Bow 2=Sword · Left click attack · Esc quit</div>
+
+<script>
+/* Infinite Archer — Browser port (full feature parity)
+   - Save as index.html and open in a modern browser.
+   - Wave enemy count multiplies by 1.1 each round.
+   - Boss every 10 waves with 2000 HP.
+   - Abilities chosen between waves (2 non-duplicate options).
+   - Fire/Poison/Lightning/Knockback implemented.
+*/
+
+/* --- Setup canvas --- */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W = innerWidth, H = innerHeight;
+function resize(){ W = innerWidth; H = innerHeight; canvas.width = W; canvas.height = H; }
+window.addEventListener('resize', resize);
+resize();
+
+/* --- Game variables --- */
+let score = 0;
+let wave = 1;
+let enemiesPerWave = 5; // start with 5
+let player = { x: W/2, y: H/2, size:40, speed:5, hp:100, maxHp:100 };
+let weapon = 'bow'; // 'bow' or 'sword'
+let arrowDamage = 20;
+let swordDamage = 40;
+let arrowSpeed = 18;
+let swordRange = 120;
+let swordArcHalf = Math.PI/4; // 45 degrees half
+let baseKnockback = 6;
+let knockbackLevel = 1;
+let ownedAbilities = { "Heal +20 HP":false, "Damage +10":false, "Flame":false, "Poison":false, "Lightning":false, "Knockback":false };
+
+/* --- Visual / effects --- */
+const floating = []; // {x,y,txt,color,ttl,vy}
+const lightningLines = []; // {x1,y1,x2,y2,ttl}
+const smallDots = []; // {x,y,color,ttl}
+
+/* --- Enemies & arrows --- */
+let enemies = [];
+let arrows = [];
+
+/* --- Timing --- */
+let lastSword = 0;
+const swordCooldown = 300;
+let running = false;
+let lastTime = performance.now();
+
+/* --- DOM UI --- */
+const uiScore = document.getElementById('score');
+const uiWave = document.getElementById('wave');
+const uiHp = document.getElementById('hp');
+const uiDmg = document.getElementById('dmg');
+const uiKb = document.getElementById('kb');
+const uiWeap = document.getElementById('weap');
+const overlay = document.getElementById('overlay');
+const musicToggle = document.getElementById('musicToggle');
+
+function updateUI(){
+  uiScore.textContent = score;
+  uiWave.textContent = wave;
+  uiHp.textContent = Math.max(0, Math.floor(player.hp));
+  uiDmg.textContent = arrowDamage;
+  uiKb.textContent = knockbackLevel;
+  uiWeap.textContent = weapon;
+}
+
+/* --- Enemy class factory --- */
+function createEnemy(x,y,etype,isMini=false,hpOverride=null){
+  let base = { hp:20, spd:2, dmg:10, color:'#dc4444', size:30 };
+  if(etype==='fast'){ base = { hp:15, spd:3, dmg:8, color:'#ffd54f', size:26 }; }
+  if(etype==='tank'){ base = { hp:40, spd:1, dmg:15, color:'#8b1b3a', size:34 }; }
+  let e = {
+    x:x, y:y,
+    etype:etype,
+    isMini:isMini,
+    isBoss:false,
+    size: isMini ? 20 : base.size,
+    color: isMini ? '#ffd54f' : base.color,
+    spd: isMini ? base.spd*2 : base.spd,
+    dmg: base.dmg,
+    hp: hpOverride!==null ? hpOverride : (isMini ? base.hp : base.hp*2), // mini = base hp, others doubled
+    burnMs:0, poisonMs:0, lastTick:0,
+    summonAt:0
+  };
+  return e;
+}
+
+/* --- Spawn logic --- */
+function spawnWave(count){
+  enemies = [];
+  for(let i=0;i<Math.floor(count);i++){
+    const side = ['top','bottom','left','right'][Math.floor(Math.random()*4)];
+    let x,y;
+    if(side==='top'){ x = rand(30, W-30); y = -40; }
+    else if(side==='bottom'){ x = rand(30, W-30); y = H+40; }
+    else if(side==='left'){ x = -40; y = rand(30, H-30); }
+    else { x = W+40; y = rand(30, H-30); }
+    const etype = ['normal','fast','tank'][rand(0,2)];
+    enemies.push(createEnemy(x,y,etype,false));
+  }
+}
+
+function spawnBoss(){
+  enemies = [];
+  const rectX = W/2, rectY = -200;
+  const boss = createEnemy(rectX, rectY, 'tank', false, 2000);
+  boss.isBoss = true;
+  boss.size = 160;
+  boss.color = '#64153e';
+  boss.spd = 1.0;
+  boss.dmg = 60; // strong
+  boss.summonAt = performance.now() + 5000;
+  enemies.push(boss);
+}
+
+function bossSummonIfReady(boss){
+  const now = performance.now();
+  if(now >= (boss.summonAt || 0)){
+    const n = rand(2,4);
+    for(let i=0;i<n;i++){
+      const rx = boss.x + rand(-80,80);
+      const ry = boss.y + rand(-80,80);
+      enemies.push(createEnemy(rx,ry,'fast',true));
+    }
+    boss.summonAt = now + 5000;
+  }
+}
+
+/* --- Helpers --- */
+function rand(a,b){ return Math.floor(Math.random()*(b-a+1))+a; }
+function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+function dist(ax,ay,bx,by){ return Math.hypot(ax-bx, ay-by); }
+function angDiff(a,b){ return Math.abs(((a-b+Math.PI)%(2*Math.PI)) - Math.PI); }
+
+/* --- Input --- */
+const keys = {};
+addEventListener('keydown', e=>{ keys[e.key.toLowerCase()] = true; if(e.key==='1'){ weapon='bow'; updateUI(); } if(e.key==='2'){ weapon='sword'; updateUI(); } if(e.key==='Escape'){ running=false; mainMenu(); } });
+addEventListener('keyup', e=>{ keys[e.key.toLowerCase()] = false; });
+
+canvas.addEventListener('mousedown', e=>{
+  if(!running) return;
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  if(weapon==='bow'){
+    arrows.push({ x: player.x, y: player.y, tx: mx, ty: my, angle: Math.atan2(my-player.y, mx-player.x), vx:0, vy:0 });
+  } else {
+    const now = performance.now();
+    if(now - lastSword >= swordCooldown){
+      lastSword = now;
+      handleSword(mx,my);
+    }
+  }
+});
+
+/* --- Arrow logic --- */
+function updateArrows(dt){
+  for(let i = arrows.length-1; i>=0; i--){
+    const a = arrows[i];
+    const dx = a.tx - a.x, dy = a.ty - a.y;
+    const d = Math.hypot(dx,dy)||1;
+    const vx = arrowSpeed * dx/d, vy = arrowSpeed * dy/d;
+    a.x += vx; a.y += vy;
+    // out of bounds
+    if(a.x < -80 || a.x > W+80 || a.y < -80 || a.y > H+80){ arrows.splice(i,1); continue; }
+    // collision with enemies
+    for(let j=enemies.length-1; j>=0; j--){
+      const e = enemies[j];
+      if(pointRectCollide(a.x, a.y, e)){
+        handleArrowHit(e);
+        arrows.splice(i,1);
+        break;
+      }
+    }
+  }
+}
+
+function pointRectCollide(px,py,e){
+  return (px >= e.x - e.size/2 && px <= e.x + e.size/2 && py >= e.y - e.size/2 && py <= e.y + e.size/2);
+}
+
+/* --- Arrow hit / elements --- */
+function handleArrowHit(e){
+  e.hp -= arrowDamage;
+  floating.push({ x: e.x, y: e.y - e.size/2 - 6, txt: `-${arrowDamage}`, color:'#d83333', ttl:60, vy:-0.6 });
+  const now = performance.now();
+  if(ownedAbilities['Flame']){ e.burnMs = 3000; e.lastTick = now - 1000; }
+  if(ownedAbilities['Poison']){ e.poisonMs = 3000; e.lastTick = now - 1000; }
+  if(ownedAbilities['Lightning']){ lightningLines.push({ x1:e.x, y1:e.y, x2:e.x, y2:e.y, ttl:250 }); applyLightning(e, arrowDamage); }
+}
+
+/* --- Lightning chain --- */
+function applyLightning(origin, baseDamage){
+  let nearby = 0;
+  const others = enemies.filter(x=>x !== origin && x.hp>0).sort((a,b)=> dist(a.x,a.y,origin.x,origin.y) - dist(b.x,b.y,origin.x,origin.y));
+  for(const e of others){
+    if(nearby >= 2) break;
+    const d = dist(e.x,e.y, origin.x, origin.y);
+    if(d <= 100){
+      const dmg = Math.floor(baseDamage/2);
+      e.hp -= dmg;
+      floating.push({ x:e.x, y:e.y - e.size/2 - 6, txt: `-${dmg}`, color:'#f1c40f', ttl:60, vy:-0.6 });
+      lightningLines.push({ x1: origin.x, y1: origin.y, x2: e.x, y2: e.y, ttl:350 });
+      nearby++;
+    }
+  }
+}
+
+/* --- Sword attack (instant cone) --- */
+function handleSword(mx, my){
+  const angle = Math.atan2(my - player.y, mx - player.x);
+  const kb = baseKnockback * knockbackLevel;
+  for(let i = enemies.length-1; i>=0; i--){
+    const e = enemies[i];
+    const ex = e.x - player.x, ey = e.y - player.y;
+    const d = Math.hypot(ex,ey);
+    if(d <= swordRange){
+      const ea = Math.atan2(ey,ex);
+      if(angDiff(ea, angle) <= swordArcHalf){
+        e.hp -= swordDamage;
+        floating.push({ x:e.x, y:e.y - e.size/2 - 6, txt:`-${swordDamage}`, color:'#d83333', ttl:60, vy:-0.6 });
+        if(d !== 0){
+          e.x += Math.round(kb * (ex/d));
+          e.y += Math.round(kb * (ey/d));
+        }
+        const now = performance.now();
+        if(ownedAbilities['Flame']){ e.burnMs = 3000; e.lastTick = now - 1000; }
+        if(ownedAbilities['Poison']){ e.poisonMs = 3000; e.lastTick = now - 1000; }
+        if(ownedAbilities['Lightning']){ lightningLines.push({ x1:e.x, y1:e.y, x2:e.x, y2:e.y, ttl:250 }); applyLightning(e, swordDamage); }
+        if(e.hp <= 0){ if(e.isBoss) score += 50; else score += 1; enemies.splice(i,1); }
+      }
+    }
+  }
+}
+
+/* --- Enemy status tick (burn/poison) --- */
+function updateEnemyStatus(now){
+  for(let i = enemies.length-1; i>=0; i--){
+    const e = enemies[i];
+    if((e.burnMs && e.burnMs>0) || (e.poisonMs && e.poisonMs>0)){
+      if(now - e.lastTick >= 1000){
+        e.lastTick = now;
+        if(e.burnMs > 0){ e.hp -= 5; smallDots.push({ x:e.x, y:e.y - e.size/2 - 8, color:'#ff8c00', ttl:30 }); floating.push({ x:e.x, y:e.y - e.size/2 - 6, txt:'-5', color:'#ff8c00', ttl:60, vy:-0.6 }); e.burnMs = Math.max(0, e.burnMs - 1000); }
+        if(e.poisonMs > 0){ e.hp -= 5; smallDots.push({ x:e.x, y:e.y - e.size/2 - 8, color:'#a020f0', ttl:30 }); floating.push({ x:e.x, y:e.y - e.size/2 - 6, txt:'-5', color:'#a020f0', ttl:60, vy:-0.6 }); e.poisonMs = Math.max(0, e.poisonMs - 1000); }
+      }
+    } else {
+      e.lastTick = now;
+    }
+  }
+}
+
+/* --- Enemy movement & collision --- */
+function updateEnemies(now){
+  for(let i=enemies.length-1;i>=0;i--){
+    const e = enemies[i];
+    if(e.isBoss) bossSummonIfReady(e);
+    // move toward player
+    const dx = player.x - e.x, dy = player.y - e.y;
+    const d = Math.hypot(dx,dy)||1;
+    e.x += Math.round(e.spd * dx / d);
+    e.y += Math.round(e.spd * dy / d);
+    // collision with player
+    if(Math.abs(e.x - player.x) < e.size/2 + player.size/2 && Math.abs(e.y - player.y) < e.size/2 + player.size/2){
+      player.hp -= e.dmg;
+      enemies.splice(i,1); // enemy removed on hit like before
+      if(player.hp <= 0){ running=false; showGameOver(); return; }
+    }
+    // remove dead
+    if(e.hp <= 0){
+      if(e.isBoss) score += 50; else score += 1;
+      enemies.splice(i,1);
+    }
+  }
+}
+
+/* --- Visual updates --- */
+function updateVisuals(dt){
+  for(let i=floating.length-1;i>=0;i--){ floating[i].y += floating[i].vy; floating[i].ttl--; if(floating[i].ttl<=0) floating.splice(i,1); }
+  for(let i=lightningLines.length-1;i>=0;i--){ lightningLines[i].ttl -= dt; if(lightningLines[i].ttl<=0) lightningLines.splice(i,1); }
+  for(let i=smallDots.length-1;i>=0;i--){ smallDots[i].ttl--; if(smallDots[i].ttl<=0) smallDots.splice(i,1); }
+}
+
+/* --- Drawing --- */
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  // player
+  ctx.fillStyle = '#32c768';
+  ctx.fillRect(player.x - player.size/2, player.y - player.size/2, player.size, player.size);
+  // bow visual (simple curved)
+  ctx.strokeStyle = '#8b4513'; ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.ellipse(player.x+6, player.y, 36, 50, Math.PI/2, 1.25*Math.PI, 0.75*Math.PI); ctx.stroke();
+  // static string
+  ctx.strokeStyle = '#111'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(player.x+12, player.y-36); ctx.lineTo(player.x+12, player.y+36); ctx.stroke();
+
+  // arrows
+  for(const a of arrows){
+    ctx.save(); ctx.translate(a.x, a.y); ctx.rotate(a.angle); ctx.fillStyle = '#111'; ctx.fillRect(-14,-3,28,6); ctx.restore();
+  }
+
+  // enemies (including boss with bar)
+  for(const e of enemies){
+    ctx.fillStyle = e.color; ctx.fillRect(e.x - e.size/2, e.y - e.size/2, e.size, e.size);
+    if(e.isBoss){
+      const bw = e.size, frac = clamp(e.hp / 2000, 0, 1);
+      ctx.fillStyle = '#8b0a2b'; ctx.fillRect(e.x - bw/2, e.y - e.size/2 - 14, bw, 8);
+      ctx.fillStyle = '#32c768'; ctx.fillRect(e.x - bw/2, e.y - e.size/2 - 14, bw * frac, 8);
+    }
+    if(e.burnMs > 0){ ctx.fillStyle = '#ff8c00'; ctx.beginPath(); ctx.arc(e.x + e.size/2 - 6, e.y - e.size/2 + 6, 5,0,Math.PI*2); ctx.fill(); }
+    if(e.poisonMs > 0){ ctx.fillStyle = '#a020f0'; ctx.beginPath(); ctx.arc(e.x - e.size/2 + 6, e.y - e.size/2 + 6, 5,0,Math.PI*2); ctx.fill(); }
+  }
+
+  // lightning lines
+  for(const L of lightningLines){
+    ctx.strokeStyle = '#f7e76a'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(L.x1, L.y1); ctx.lineTo(L.x2, L.y2); ctx.stroke();
+  }
+
+  // floating texts
+  ctx.font = '18px system-ui'; ctx.textAlign = 'center';
+  for(const f of floating){ ctx.fillStyle = f.color; ctx.fillText(f.txt, f.x, f.y); }
+
+  // small dots
+  for(const d of smallDots){ ctx.fillStyle = d.color; ctx.beginPath(); ctx.arc(d.x, d.y, 4, 0, Math.PI*2); ctx.fill(); }
+
+  // HUD (drawn in DOM too; keep canvas HUD minimal)
+  // nothing else
+}
+
+/* --- Wave & ability selection flow --- */
+function pickTwoAbilities(){
+  const avail = [];
+  if(!ownedAbilities['Heal +20 HP']) avail.push('Heal +20 HP');
+  if(!ownedAbilities['Damage +10']) avail.push('Damage +10');
+  if(!ownedAbilities['Flame']) avail.push('Flame');
+  if(!ownedAbilities['Poison']) avail.push('Poison');
+  if(!ownedAbilities['Lightning']) avail.push('Lightning');
+  if(knockbackLevel < 5) avail.push('Knockback');
+  if(avail.length === 0) return [];
+  if(avail.length === 1) return [avail[0]];
+  // pick two distinct
+  const a = avail.splice(rand(0, avail.length-1), 1)[0];
+  const b = avail.splice(rand(0, avail.length-1), 1)[0];
+  return [a,b];
+}
+
+function showAbilityChoicesThenContinue(callback){
+  const choices = pickTwoAbilities();
+  if(choices.length === 0){
+    // no choices; just countdown
+    beginCountdownThenNext(callback);
+    return;
+  }
+  // show overlay with two clickable boxes
+  overlay.innerHTML = '';
+  overlay.style.display = 'flex';
+  const menu = document.createElement('div'); menu.className='menu';
+  const title = document.createElement('div'); title.style.fontSize='26px'; title.style.fontWeight=800; title.textContent='Choose an Upgrade';
+  menu.appendChild(title);
+  const row = document.createElement('div'); row.className='row';
+  choices.forEach(ch=>{
+    const b = document.createElement('div'); b.className='ability'; b.textContent = ch === 'Knockback' ? 'Knockback +1' : ch;
+    b.onclick = ()=>{
+      // apply pick
+      if(ch === 'Heal +20 HP'){ player.hp = Math.min(player.maxHp, player.hp + 20); ownedAbilities[ch] = true; }
+      else if(ch === 'Damage +10'){ arrowDamage += 10; ownedAbilities[ch] = true; }
+      else if(ch === 'Flame'){ ownedAbilities['Flame'] = true; }
+      else if(ch === 'Poison'){ ownedAbilities['Poison'] = true; }
+      else if(ch === 'Lightning'){ ownedAbilities['Lightning'] = true; }
+      else if(ch === 'Knockback'){ knockbackLevel = Math.min(5, knockbackLevel + 1); ownedAbilities['Knockback'] = true; }
+      overlay.style.display = 'none';
+      updateUI();
+      beginCountdownThenNext(callback);
+    };
+    row.appendChild(b);
+  });
+  menu.appendChild(row);
+  overlay.appendChild(menu);
+}
+
+/* countdown then spawn next wave */
+function beginCountdownThenNext(callback){
+  overlay.innerHTML = '';
+  overlay.style.display = 'flex';
+  let s = 5;
+  const box = document.createElement('div'); box.className='menu';
+  const big = document.createElement('div'); big.style.fontSize='34px'; big.style.fontWeight=800; big.textContent = `Next Wave in ${s}`;
+  box.appendChild(big);
+  overlay.appendChild(box);
+  const iv = setInterval(()=>{
+    s--;
+    big.textContent = `Next Wave in ${s}`;
+    if(s <= 0){ clearInterval(iv); overlay.style.display='none'; callback(); }
+  }, 1000);
+}
+
+/* --- Game loop --- */
+function gameLoop(ts){
+  if(!running) return;
+  const now = performance.now();
+  const dt = now - lastTime;
+  lastTime = now;
+
+  // player movement
+  if(keys['w']) player.y -= player.speed;
+  if(keys['s']) player.y += player.speed;
+  if(keys['a']) player.x -= player.speed;
+  if(keys['d']) player.x += player.speed;
+  player.x = clamp(player.x, player.size/2, W - player.size/2);
+  player.y = clamp(player.y, player.size/2, H - player.size/2);
+
+  // update arrows
+  updateArrows(dt);
+
+  // update enemy status ticks
+  updateEnemyStatus(now);
+
+  // update enemies (movement, boss summon, collisions)
+  updateEnemies(now);
+
+  // visuals
+  updateVisuals(dt);
+
+  // update UI DOM
+  updateUI();
+
+  // draw
+  draw();
+
+  // if wave cleared -> show abilities then countdown then spawn
+  if(enemies.length === 0){
+    running = false;
+    showAbilityChoicesThenContinue(()=>{
+      wave++;
+      enemiesPerWave = Math.max(1, Math.round(enemiesPerWave * 1.1)); // multiply by 1.1 each round
+      if(wave % 10 === 0) spawnBoss();
+      else spawnWave(enemiesPerWave);
+      running = true;
+      lastTime = performance.now();
+      requestAnimationFrame(gameLoop);
+    });
+    return;
+  }
+
+  requestAnimationFrame(gameLoop);
+}
+
+/* --- Menu / start / abilities screen / game over --- */
+function mainMenu(){
+  overlay.innerHTML = '';
+  overlay.style.display = 'flex';
+  const menu = document.createElement('div'); menu.className='menu';
+  const title = document.createElement('div'); title.style.fontSize='32px'; title.style.fontWeight=900; title.textContent='Infinite Archer';
+  menu.appendChild(title);
+  const row = document.createElement('div'); row.className='row';
+  const startBtn = document.createElement('div'); startBtn.className='btn'; startBtn.textContent='Start Game';
+  startBtn.onclick = ()=>{ overlay.style.display='none'; startGame(); };
+  const abilitiesBtn = document.createElement('div'); abilitiesBtn.className='btn'; abilitiesBtn.textContent='Abilities';
+  abilitiesBtn.onclick = ()=>{ overlay.style.display='none'; showAbilitiesScreen(); };
+  const quitBtn = document.createElement('div'); quitBtn.className='btn'; quitBtn.textContent='Quit';
+  quitBtn.onclick = ()=>{ window.close(); };
+  row.appendChild(startBtn); row.appendChild(abilitiesBtn); row.appendChild(quitBtn);
+  menu.appendChild(row);
+  overlay.appendChild(menu);
+}
+function showAbilitiesScreen(){
+  overlay.innerHTML = ''; overlay.style.display = 'flex';
+  const menu = document.createElement('div'); menu.className='menu';
+  const title = document.createElement('div'); title.style.fontSize='26px'; title.style.fontWeight=800; title.textContent='Abilities';
+  menu.appendChild(title);
+  const grid = document.createElement('div'); grid.style.marginTop='12px';
+  Object.keys(ownedAbilities).forEach(k=>{
+    const el = document.createElement('div'); el.className='ability'; el.style.margin='6px'; el.style.display='inline-block';
+    el.textContent = (k==='Knockback' ? `Knockback Lv ${knockbackLevel}` : k);
+    if(ownedAbilities[k]) el.classList.add('disabled');
+    grid.appendChild(el);
+  });
+  menu.appendChild(grid);
+  const back = document.createElement('div'); back.className='btn'; back.textContent='Back'; back.style.marginTop='12px';
+  back.onclick = ()=>{ overlay.style.display='none'; mainMenu(); };
+  menu.appendChild(back);
+  overlay.appendChild(menu);
+}
+
+function showGameOver(){
+  overlay.innerHTML = ''; overlay.style.display='flex';
+  const menu = document.createElement('div'); menu.className='menu';
+  const t = document.createElement('div'); t.style.fontSize='28px'; t.style.fontWeight=800; t.textContent='Game Over';
+  menu.appendChild(t);
+  const sEl = document.createElement('div'); sEl.style.marginTop='10px'; sEl.textContent = `Final Score: ${score}`;
+  menu.appendChild(sEl);
+  const row = document.createElement('div'); row.className='row';
+  const r1 = document.createElement('div'); r1.className='btn'; r1.textContent='Restart'; r1.onclick = ()=>{ overlay.style.display='none'; startGame(); };
+  const r2 = document.createElement('div'); r2.className='btn'; r2.textContent='Main Menu'; r2.onclick = ()=>{ overlay.style.display='none'; mainMenu(); };
+  row.appendChild(r1); row.appendChild(r2); menu.appendChild(row);
+  overlay.appendChild(menu);
+}
+
+/* --- Start / reset --- */
+function startGame(){
+  score = 0; wave = 1; enemiesPerWave = 5; player.x = W/2; player.y = H/2; player.hp = player.maxHp;
+  arrows = []; floating.length = 0; lightningLines.length = 0; smallDots.length = 0;
+  // reset abilities but preserve ability ownership? we preserve as persistent as in original
+  // (If you want new run to reset owned abilities, uncomment below)
+  // Object.keys(ownedAbilities).forEach(k=> ownedAbilities[k]=false); knockbackLevel=1; arrowDamage=20;
+  spawnWave(enemiesPerWave);
+  running = true; lastTime = performance.now(); requestAnimationFrame(gameLoop);
+}
+
+/* --- Utility for audio: generate simple ambient loop via WebAudio --- */
+let audioCtx = null;
+let masterGain = null;
+let isMusicPlaying = false;
+function initMusic(){
+  try{
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    masterGain = audioCtx.createGain();
+    masterGain.gain.value = 0.12;
+    masterGain.connect(audioCtx.destination);
+
+    // add a simple arpeggio-ish loop using 3 oscillators
+    const duration = 2.0;
+    function schedule(){
+      const t0 = audioCtx.currentTime;
+      const notes = [220, 277.18, 329.63, 392.00]; // A, C#, E, G
+      for(let i=0;i<notes.length;i++){
+        const osc = audioCtx.createOscillator();
+        osc.type = 'sine';
+        const env = audioCtx.createGain();
+        env.gain.value = 0;
+        osc.frequency.value = notes[(i + Math.floor((Date.now()/1000) % notes.length)) % notes.length];
+        osc.connect(env); env.connect(masterGain);
+        osc.start(t0 + i * 0.14);
+        env.gain.setValueAtTime(0.0001, t0 + i*0.14);
+        env.gain.exponentialRampToValueAtTime(0.12, t0 + i*0.14 + 0.02);
+        env.gain.exponentialRampToValueAtTime(0.0001, t0 + i*0.14 + duration);
+        osc.stop(t0 + i*0.14 + duration + 0.02);
+      }
+      // scheduler loop
+      if(isMusicPlaying) setTimeout(schedule, duration*1000 - 200);
+    }
+    isMusicPlaying = true; schedule();
+  }catch(e){
+    console.warn('Music not available', e);
+  }
+}
+function stopMusic(){ if(audioCtx){ try{ audioCtx.close(); }catch(e){} audioCtx = null; isMusicPlaying=false; } }
+musicToggle.onclick = ()=>{
+  if(!isMusicPlaying){ initMusic(); musicToggle.textContent='Music: On'; }
+  else { stopMusic(); musicToggle.textContent='Music: Off'; }
+};
+
+/* --- Utility random small visual constants --- */
+const ORANGE = '#ff8c00', PURPLE = '#a020f0';
+
+/* --- Start with menu --- */
+updateUI();
+mainMenu();
+
+/* --- small helpers to keep code tidy --- */
+function clamp(v,a,b){ return Math.max(a, Math.min(b,v)); }
+
+</script>
+</body>
+</html>
