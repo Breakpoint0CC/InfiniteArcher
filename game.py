@@ -1,11 +1,10 @@
 # test.py
-# Infinite Archer - Admin Panel, Options (keyboard), background color, music toggle
+# Infinite Archer - Final: menu buttons, options, admin, EXP orbs collectible only at end of wave
 # Run with: python test.py (requires pygame)
 
 import pygame, random, math, sys, os, time
 
 pygame.init()
-# no automatic music load; Options can toggle music on if file present
 try:
     pygame.mixer.init()
 except Exception:
@@ -40,7 +39,8 @@ PURPLE = (160,32,240)
 CYAN = (0,200,255)
 LIGHT_GRAY = (230,230,230)
 DARK_GRAY = (40,40,40)
-SKY_BLUE = (200, 230, 255)
+SKY_BLUE = (200,230,255)
+BLUE = (40,140,255)
 
 FONT_LG = pygame.font.SysFont(None, 84)
 FONT_MD = pygame.font.SysFont(None, 44)
@@ -63,7 +63,7 @@ DEFAULTS = {
     "archer_shot_damage": 10
 }
 
-# --- Global state that will be reset via reset_game() ---
+# --- Global state reset function ---
 def reset_game():
     global player, player_speed, max_hp, player_hp
     global arrow_speed, arrow_damage, sword_damage
@@ -75,6 +75,9 @@ def reset_game():
     global weapon
     global bg_color, music_enabled
     global admin_unlocked, admin_available_next_game
+    global player_level, player_exp, exp_required
+    global pending_orbs, collected_exp_this_wave
+    global in_collection_phase, collection_start_ms, collection_duration_ms
 
     # Player / combat
     player_size = DEFAULTS["player_size"]
@@ -119,14 +122,28 @@ def reset_game():
     weapon = "bow"
 
     # UI / options defaults
-    bg_color = WHITE  # can be changed in Options (1..4)
-    music_enabled = False  # toggled in Options; requires 'music.mp3' in folder
+    bg_color = WHITE
+    music_enabled = False
 
-    # admin unlock flags: typing 'openadminpanel' in menu sets admin_available_next_game True
+    # admin flags
     admin_unlocked = False
     admin_available_next_game = False
 
-    # export to globals
+    # EXP / leveling
+    player_level = 1
+    player_exp = 0
+    exp_required = 10 + 10 * (player_level - 1)  # level1 -> 10, level2 -> 20, etc.
+
+    # orbs (spawned on enemy death) — not applied until collection phase
+    pending_orbs = []  # list of dicts {x,y,amount,ttl}
+    collected_exp_this_wave = 0
+
+    # collection phase control
+    in_collection_phase = False
+    collection_start_ms = None
+    collection_duration_ms = 5000  # 5 seconds to collect
+
+    # export
     globals().update({
         "player": player, "player_speed": player_speed, "player_hp": player_hp, "max_hp": max_hp,
         "arrow_speed": arrow_speed, "arrow_damage": arrow_damage, "sword_damage": sword_damage,
@@ -137,16 +154,19 @@ def reset_game():
         "floating_texts": floating_texts, "lightning_lines": lightning_lines, "small_dots": small_dots,
         "wave": wave, "enemies_per_wave": enemies_per_wave, "score": score,
         "weapon": weapon, "bg_color": bg_color, "music_enabled": music_enabled,
-        "admin_unlocked": admin_unlocked, "admin_available_next_game": admin_available_next_game
+        "admin_unlocked": admin_unlocked, "admin_available_next_game": admin_available_next_game,
+        "player_level": player_level, "player_exp": player_exp, "exp_required": exp_required,
+        "pending_orbs": pending_orbs, "collected_exp_this_wave": collected_exp_this_wave,
+        "in_collection_phase": in_collection_phase, "collection_start_ms": collection_start_ms,
+        "collection_duration_ms": collection_duration_ms
     })
 
-# initialize
 reset_game()
 
-# optional music file name (place music.mp3 in same folder if you want to use it)
+# optional music file
 MUSIC_FILE = "music.mp3"
 
-# --- helpers & draw ---
+# --- Helpers & draw functions ---
 def draw_text_centered(font, text, y, color=BLACK):
     surf = font.render(text, True, color)
     screen.blit(surf, (WIDTH//2 - surf.get_width()//2, y))
@@ -158,6 +178,22 @@ def draw_hp_bar(hp):
     pygame.draw.rect(screen, GREEN, (x, y, int(w * (hp / max_hp)), h))
     pygame.draw.rect(screen, BLACK, (x, y, w, h), 2)
 
+def draw_exp_bar():
+    # bottom of screen
+    margin = 12
+    w = WIDTH - margin*2
+    h = 18
+    x = margin
+    y = HEIGHT - h - 12
+    pygame.draw.rect(screen, DARK_GRAY, (x,y,w,h))
+    frac = 0.0
+    if exp_required > 0:
+        frac = min(1.0, player_exp / exp_required)
+    pygame.draw.rect(screen, BLUE, (x, y, int(w * frac), h))
+    pygame.draw.rect(screen, BLACK, (x,y,w,h), 2)
+    lvl_txt = FONT_SM.render(f"Level: {player_level}  EXP: {player_exp}/{exp_required}", True, BLACK)
+    screen.blit(lvl_txt, (x + 6, y - 24))
+
 def draw_bow(player_rect):
     bow_length = 60
     arc_rect = pygame.Rect(player_rect.centerx - 12, player_rect.centery - bow_length, 24, bow_length * 2)
@@ -166,7 +202,7 @@ def draw_bow(player_rect):
     bottom = (player_rect.centerx + 4, player_rect.centery + int(bow_length * 0.9))
     pygame.draw.line(screen, BLACK, top, bottom, 2)
 
-# --- Enemy class with archer support ---
+# --- Enemy class & behaviors ---
 class Enemy:
     def __init__(self, rect, etype="normal", is_mini=False, hp_override=None):
         self.rect = rect
@@ -336,7 +372,11 @@ def apply_lightning_chain(origin_enemy, base_damage):
             lightning_lines.append({"x1": ox, "y1": oy, "x2": e.rect.centerx, "y2": e.rect.centery, "ttl": 350})
             nearby += 1
 
-# --- Hits & effects ---
+# --- Handle hits, deaths, orb drops ---
+def spawn_orb(x,y,amount=1):
+    # orb TTL while visible (just to fade if not collected before collection phase ends)
+    pending_orbs.append({"x": x, "y": y, "amount": amount, "ttl": 9999})
+
 def handle_arrow_hit(enemy):
     global score
     enemy.hp -= arrow_damage
@@ -356,6 +396,7 @@ def handle_sword_attack(mx, my):
     global enemies, score
     kb = base_knockback * knockback_level
     angle_to_mouse = math.atan2(my - player.centery, mx - player.centerx)
+    hit_any = False
     for enemy in enemies[:]:
         ex = enemy.rect.centerx - player.centerx
         ey = enemy.rect.centery - player.centery
@@ -364,6 +405,7 @@ def handle_sword_attack(mx, my):
             enemy_angle = math.atan2(ey, ex)
             diff = abs((enemy_angle - angle_to_mouse + math.pi) % (2*math.pi) - math.pi)
             if diff <= sword_arc_half * 1.05:
+                hit_any = True
                 enemy.hp -= sword_damage
                 floating_texts.append({"x": enemy.rect.centerx, "y": enemy.rect.top - 12, "txt": f"-{sword_damage}", "color": RED, "ttl": 60, "vy": -0.6, "alpha":255})
                 if dist != 0:
@@ -379,17 +421,22 @@ def handle_sword_attack(mx, my):
                     lightning_lines.append({"x1": enemy.rect.centerx, "y1": enemy.rect.centery, "x2": enemy.rect.centerx, "y2": enemy.rect.centery, "ttl": 250})
                     apply_lightning_chain(enemy, sword_damage)
                 if enemy.hp <= 0:
+                    # when enemy dies, spawn orbs at its position
+                    if getattr(enemy, "is_boss", False):
+                        score += 25
+                        # boss orb amount: 10 + 10*(wave-1)
+                        amt = 10 + 10 * (wave - 1)
+                        spawn_orb(enemy.rect.centerx, enemy.rect.centery, amount=amt)
+                    else:
+                        score += 1
+                        spawn_orb(enemy.rect.centerx, enemy.rect.centery, amount=1)
                     try:
-                        if enemy.is_boss:
-                            score += 25
-                        else:
-                            score += 1
                         enemies.remove(enemy)
                     except ValueError:
                         pass
+    return hit_any
 
-# --- Menus & Input (main menu secret typing) ---
-# secret unlock buffer for "openadminpanel"
+# --- Menus & secret typing (admin) ---
 secret_sequence = "openadminpanel"
 secret_buffer = ""
 
@@ -401,7 +448,7 @@ def main_menu():
         draw_text_centered(FONT_LG, "Infinite Archer", HEIGHT//6)
         mx, my = pygame.mouse.get_pos()
 
-        # Main menu buttons: Start, Options, Quit
+        # Buttons: Start, Options, Quit (clickable)
         btn_w = 360; btn_h = 70
         start_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 - 120, btn_w, btn_h)
         options_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 - 20, btn_w, btn_h)
@@ -414,11 +461,9 @@ def main_menu():
             surf = FONT_MD.render(label, True, BLACK)
             screen.blit(surf, (rect.x + 18, rect.y + 18))
 
-        # hint: options controls
-        hint = FONT_SM.render("Options use keyboard keys. In Options: M toggle music, 1-4 change background color", True, BLACK)
+        hint = FONT_SM.render("Options: M toggle music, 1-4 pick background color", True, BLACK)
         screen.blit(hint, (WIDTH//2 - hint.get_width()//2, HEIGHT - 60))
 
-        # show small message if admin unlocked
         if admin_unlocked:
             m = FONT_SM.render("Admin unlocked — will appear next game", True, (150,0,50))
             screen.blit(m, (WIDTH//2 - m.get_width()//2, HEIGHT//2 - 180))
@@ -435,21 +480,17 @@ def main_menu():
                 if quit_rect.collidepoint(mx,my):
                     pygame.quit(); sys.exit()
             if ev.type == pygame.KEYDOWN:
-                # track secret sequence
                 secret_buffer += ev.unicode.lower()
-                # keep buffer length bounded
                 if len(secret_buffer) > len(secret_sequence):
                     secret_buffer = secret_buffer[-len(secret_sequence):]
                 if secret_buffer == secret_sequence:
                     admin_unlocked = True
                     admin_available_next_game = True
-                    # notify briefly
                     notify_once("Admin unlocked — will appear next game")
                 if ev.key == pygame.K_ESCAPE:
                     pygame.quit(); sys.exit()
         clock.tick(FPS)
 
-# notify helper (shows message for a short time)
 def notify_once(msg, duration=1200):
     start = pygame.time.get_ticks()
     while pygame.time.get_ticks() - start < duration:
@@ -461,10 +502,9 @@ def notify_once(msg, duration=1200):
                 pygame.quit(); sys.exit()
         clock.tick(FPS)
 
-# --- Options menu (keyboard-based) ---
+# --- Options menu (keyboard) ---
 def options_menu():
     global music_enabled, bg_color
-    # try to load music if file exists
     music_available = os.path.exists(MUSIC_FILE)
     while True:
         screen.fill(bg_color)
@@ -478,7 +518,6 @@ def options_menu():
         for i, ln in enumerate(lines):
             surf = FONT_MD.render(ln, True, BLACK)
             screen.blit(surf, (WIDTH//2 - surf.get_width()//2, HEIGHT//3 + i*44))
-        # show current states
         status = FONT_SM.render(f"Music: {'ON' if music_enabled else 'OFF'}    Background color: {bg_color}", True, BLACK)
         screen.blit(status, (WIDTH//2 - status.get_width()//2, HEIGHT - 120))
         pygame.display.flip()
@@ -489,7 +528,6 @@ def options_menu():
                 if ev.key == pygame.K_ESCAPE:
                     return
                 if ev.key == pygame.K_m:
-                    # toggle music on/off; only try to play if file exists
                     if not music_enabled:
                         if music_available:
                             try:
@@ -517,9 +555,9 @@ def options_menu():
                     bg_color = BLACK
         clock.tick(FPS)
 
-# --- Ability choice between waves (unchanged logical behavior) ---
+# --- Ability choice between waves (unchanged behavior) ---
 def ability_choice_between_waves():
-    global player_hp, arrow_damage, knockback_level, owned_abilities, pierce_level
+    global player_hp, arrow_damage, knockback_level, owned_abilities, pierce_level, player_level, player_exp
     avail = []
     if not owned_abilities.get("Flame", False): avail.append("Flame")
     if not owned_abilities.get("Poison", False): avail.append("Poison")
@@ -601,13 +639,11 @@ def game_over_screen():
                 return
         clock.tick(FPS)
 
-# --- initial spawn ---
+# initial spawn
 spawn_wave(enemies_per_wave := DEFAULTS["enemies_per_wave_start"])
 
-# --- Admin Panel overlay (invoked during gameplay if unlocked) ---
-# Admin appears as top-right button ONLY if admin_available_next_game True (set by secret in menu)
+# --- Admin Panel (top-right button in-game; unlocked via secret) ---
 def draw_admin_button():
-    # small rectangle top-right
     rect = pygame.Rect(WIDTH - 160, 12, 148, 36)
     pygame.draw.rect(screen, LIGHT_GRAY, rect)
     pygame.draw.rect(screen, BLACK, rect, 2)
@@ -616,10 +652,9 @@ def draw_admin_button():
     return rect
 
 def admin_panel_overlay():
-    global player_hp, arrow_damage, score, player_speed, owned_abilities, pierce_level, knockback_level
-    selected = None
-    # temporary working copies to show
+    global player_hp, max_hp, arrow_damage, score, player_speed, owned_abilities, pierce_level, knockback_level
     temp_hp = player_hp
+    temp_max_hp = max_hp
     temp_damage = arrow_damage
     temp_score = score
     temp_speed = player_speed
@@ -628,20 +663,16 @@ def admin_panel_overlay():
     temp_owned = owned_abilities.copy()
 
     def draw_overlay():
-        # semi-transparent background
         overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         overlay.fill((255,255,255,220))
         screen.blit(overlay, (0,0))
-        # panel
         panel = pygame.Rect(WIDTH//2 - 360, HEIGHT//2 - 260, 720, 520)
         pygame.draw.rect(screen, WHITE, panel)
         pygame.draw.rect(screen, BLACK, panel, 2)
-        # title
         title = FONT_LG.render("Admin Panel", True, BLACK)
         screen.blit(title, (panel.x + 20, panel.y + 18))
-        # fields with +/- buttons
         labels = [
-            ("Player HP", str(temp_hp)),
+            ("Player Max HP", str(temp_max_hp)),
             ("Damage", str(temp_damage)),
             ("Score", str(temp_score)),
             ("Speed", str(temp_speed)),
@@ -652,35 +683,29 @@ def admin_panel_overlay():
             y = panel.y + 110 + i*56
             lab_surf = FONT_MD.render(lab, True, BLACK)
             screen.blit(lab_surf, (panel.x + 24, y))
-            # value box
             val_rect = pygame.Rect(panel.x + 220, y, 140, 40)
             pygame.draw.rect(screen, LIGHT_GRAY, val_rect)
             pygame.draw.rect(screen, BLACK, val_rect, 2)
             v_surf = FONT_MD.render(val, True, BLACK)
             screen.blit(v_surf, (val_rect.x + 12, val_rect.y + 6))
-            # plus/minus
             minus = pygame.Rect(val_rect.right + 12, y, 40, 40)
             plus = pygame.Rect(val_rect.right + 60, y, 40, 40)
             pygame.draw.rect(screen, LIGHT_GRAY, minus); pygame.draw.rect(screen, BLACK, minus, 2)
             pygame.draw.rect(screen, LIGHT_GRAY, plus); pygame.draw.rect(screen, BLACK, plus, 2)
             screen.blit(FONT_MD.render("-", True, BLACK), (minus.x + 12, minus.y + 4))
             screen.blit(FONT_MD.render("+", True, BLACK), (plus.x + 10, plus.y + 4))
-        # Abilities checkboxes
         ab_start_y = panel.y + 420
         ab_x = panel.x + 24
         for idx, k in enumerate(["Flame","Poison","Lightning","Knockback","Piercing"]):
             y = ab_start_y + idx*36
-            # checkbox
             cb = pygame.Rect(ab_x, y, 24, 24)
             pygame.draw.rect(screen, LIGHT_GRAY, cb)
             pygame.draw.rect(screen, BLACK, cb, 2)
             if temp_owned.get(k, False):
-                # draw tick
                 pygame.draw.line(screen, BLACK, (cb.x+4, cb.y+12), (cb.x+10, cb.y+18), 3)
                 pygame.draw.line(screen, BLACK, (cb.x+10, cb.y+18), (cb.x+20, cb.y+6), 3)
             label = FONT_MD.render(k, True, BLACK)
             screen.blit(label, (cb.right + 12, y - 2))
-        # Apply and Close buttons
         apply_rect = pygame.Rect(panel.right - 220, panel.bottom - 72, 88, 40)
         close_rect = pygame.Rect(panel.right - 112, panel.bottom - 72, 88, 40)
         pygame.draw.rect(screen, LIGHT_GRAY, apply_rect); pygame.draw.rect(screen, BLACK, apply_rect, 2)
@@ -689,7 +714,6 @@ def admin_panel_overlay():
         screen.blit(FONT_MD.render("Close", True, BLACK), (close_rect.x + 12, close_rect.y + 6))
         return panel, apply_rect, close_rect
 
-    # interaction loop
     while True:
         panel, apply_rect, close_rect = draw_overlay()
         pygame.display.flip()
@@ -698,28 +722,25 @@ def admin_panel_overlay():
                 pygame.quit(); sys.exit()
             if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 mx,my = ev.pos
-                # check plus/minus for fields
-                # fields positions
-                for i, key in enumerate(["hp","damage","score","speed","pierce","kb"]):
+                for i, key in enumerate(["maxhp","damage","score","speed","pierce","kb"]):
                     y = panel.y + 110 + i*56
                     val_rect = pygame.Rect(panel.x + 220, y, 140, 40)
                     minus = pygame.Rect(val_rect.right + 12, y, 40, 40)
                     plus = pygame.Rect(val_rect.right + 60, y, 40, 40)
                     if minus.collidepoint(mx,my):
-                        if key == "hp": temp_hp = max(1, temp_hp - 10)
+                        if key == "maxhp": temp_max_hp = max(1, temp_max_hp - 10)
                         if key == "damage": temp_damage = max(1, temp_damage - 1)
                         if key == "score": temp_score = max(0, temp_score - 1)
                         if key == "speed": temp_speed = max(1, temp_speed - 1)
                         if key == "pierce": temp_pierce = max(0, temp_pierce - 1)
                         if key == "kb": temp_kb = max(0, temp_kb - 1)
                     if plus.collidepoint(mx,my):
-                        if key == "hp": temp_hp += 10
+                        if key == "maxhp": temp_max_hp += 10
                         if key == "damage": temp_damage += 1
                         if key == "score": temp_score += 1
                         if key == "speed": temp_speed += 1
                         if key == "pierce": temp_pierce = min(pierce_max_level, temp_pierce + 1)
                         if key == "kb": temp_kb = min(5, temp_kb + 1)
-                # check checkboxes toggles
                 ab_start_y = panel.y + 420
                 ab_x = panel.x + 24
                 for idx, k in enumerate(["Flame","Poison","Lightning","Knockback","Piercing"]):
@@ -727,17 +748,14 @@ def admin_panel_overlay():
                     cb = pygame.Rect(ab_x, y, 24, 24)
                     if cb.collidepoint(mx,my):
                         temp_owned[k] = not temp_owned.get(k, False)
-                # apply / close buttons
                 if apply_rect.collidepoint(mx,my):
-                    # commit changes to global game state
-                    globals()["player_hp"] = min(temp_hp, temp_hp)  # set current HP (cap logic outside)
-                    globals()["max_hp"] = temp_hp
+                    globals()["max_hp"] = temp_max_hp
+                    globals()["player_hp"] = min(player_hp, temp_max_hp)
                     globals()["arrow_damage"] = temp_damage
                     globals()["score"] = temp_score
                     globals()["player_speed"] = temp_speed
                     globals()["pierce_level"] = temp_pierce
                     globals()["knockback_level"] = temp_kb
-                    # assign abilities
                     for k,v in temp_owned.items():
                         owned_abilities[k] = v
                     return
@@ -747,18 +765,20 @@ def admin_panel_overlay():
                 return
         clock.tick(FPS)
 
-# --- Initial spawn call done earlier; ensure enemies list exists
+# --- initial spawn call ensured earlier ---
 spawn_wave(enemies_per_wave)
 
-# --- Main game loop (with admin button if unlocked for this game) ---
+# --- Main game loop with collection phase & EXP logic ---
 def game_loop():
     global weapon, arrows, enemies, enemy_arrows, wave, enemies_per_wave, score, player_hp
-    global last_sword_attack, pierce_level, admin_available_next_game, admin_unlocked, bg_color, music_enabled
+    global last_sword_attack, pierce_level, admin_available_next_game, admin_unlocked
+    global player_exp, player_level, exp_required, pending_orbs, collected_exp_this_wave
+    global in_collection_phase, collection_start_ms, collection_duration_ms, bg_color
 
     last_sword_attack = -9999
     player.center = (WIDTH//2, HEIGHT//2)
 
-    # if admin_available_next_game True, show admin button this run; then clear the flag so it's only for this game
+    # admin button shown this run if unlocked previously
     show_admin_button = False
     if admin_available_next_game:
         show_admin_button = True
@@ -779,20 +799,43 @@ def game_loop():
                     weapon = "bow"
                 if ev.key == pygame.K_2:
                     weapon = "sword"
+                if in_collection_phase:
+                    # SPACE collects all immediately
+                    if ev.key == pygame.K_SPACE:
+                        # collect everything
+                        for orb in pending_orbs[:]:
+                            player_exp += orb["amount"]
+                        collected_exp_this_wave = sum(o["amount"] for o in pending_orbs)
+                        pending_orbs.clear()
+                        # force exit collection phase (will trigger level check below)
+                        collection_start_ms = now_ms - collection_duration_ms - 1
             if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 mx,my = pygame.mouse.get_pos()
-                # admin button click (top-right)
+                # admin open button
                 if show_admin_button:
                     admin_rect = pygame.Rect(WIDTH - 160, 12, 148, 36)
                     if admin_rect.collidepoint(mx,my):
                         admin_panel_overlay()
                         continue
+                # if in collection phase, allow clicking orbs to collect
+                if in_collection_phase:
+                    for orb in pending_orbs[:]:
+                        ox, oy = orb["x"], orb["y"]
+                        rect = pygame.Rect(ox-8, oy-8, 16, 16)
+                        if rect.collidepoint(mx,my):
+                            player_exp += orb["amount"]
+                            collected_exp_this_wave += orb["amount"]
+                            try: pending_orbs.remove(orb)
+                            except ValueError: pass
+                            break
+                    continue
+                # normal gameplay input
                 if weapon == "bow":
                     arrows.append(Arrow(player.centerx, player.centery, mx, my, pierce=pierce_level))
                 elif weapon == "sword":
-                    now_ms = pygame.time.get_ticks()
-                    if now_ms - last_sword_attack >= sword_cooldown:
-                        last_sword_attack = now_ms
+                    now_ms_local = pygame.time.get_ticks()
+                    if now_ms_local - last_sword_attack >= sword_cooldown:
+                        last_sword_attack = now_ms_local
                         handle_sword_attack(mx, my)
 
         # movement
@@ -817,7 +860,7 @@ def game_loop():
                 try: enemy_arrows.remove(ea)
                 except ValueError: pass
 
-        # enemies update
+        # enemies logic
         for enemy in enemies[:]:
             if getattr(enemy, "is_boss", False):
                 boss_try_summon(enemy)
@@ -829,11 +872,14 @@ def game_loop():
             enemy.apply_status(now_ms)
 
             if enemy.hp <= 0:
+                if getattr(enemy, "is_boss", False):
+                    score += 25
+                    amt = 10 + 10 * (wave - 1)
+                    spawn_orb(enemy.rect.centerx, enemy.rect.centery, amount=amt)
+                else:
+                    score += 1
+                    spawn_orb(enemy.rect.centerx, enemy.rect.centery, amount=1)
                 try:
-                    if getattr(enemy, "is_boss", False):
-                        score += 25
-                    else:
-                        score += 1
                     enemies.remove(enemy)
                 except ValueError:
                     pass
@@ -859,7 +905,7 @@ def game_loop():
                     game_over_screen()
                     return
 
-        # player arrows hitting enemies with piercing
+        # arrows hitting enemies (piercing)
         for a in arrows[:]:
             for enemy in enemies[:]:
                 if enemy.rect.colliderect(a.rect):
@@ -871,26 +917,64 @@ def game_loop():
                         except ValueError: pass
                         break
 
-        # wave clear
-        if not enemies:
-            ability_choice_between_waves()
-            # 5-second countdown visual
-            for s in range(5, 0, -1):
-                screen.fill(bg_color)
-                txt = FONT_LG.render(f"Next Wave in {s}", True, BLACK)
-                screen.blit(txt, (WIDTH//2 - txt.get_width()//2, HEIGHT//2 - txt.get_height()//2))
-                draw_hp_bar(player_hp)
-                pygame.display.flip()
-                pygame.time.delay(1000)
-            wave += 1
-            enemies_per_wave = max(1, int(round(enemies_per_wave * 1.1)))
+        # --- Wave cleared: start collection phase ---
+        if not enemies and not in_collection_phase:
+            # start collecting: show pending orbs and allow collection for collection_duration_ms
+            in_collection_phase = True
+            collection_start_ms = pygame.time.get_ticks()
+            collected_exp_this_wave = 0
+            # center player
             player.center = (WIDTH//2, HEIGHT//2)
-            if wave % 10 == 0:
-                spawn_boss()
-            else:
-                spawn_wave(enemies_per_wave)
 
-        # floating texts update
+        # handle collection phase timing & finish
+        if in_collection_phase:
+            elapsed = now_ms - collection_start_ms
+            if elapsed >= collection_duration_ms:
+                # auto-collect remaining
+                for orb in pending_orbs[:]:
+                    player_exp += orb["amount"]
+                    collected_exp_this_wave += orb["amount"]
+                pending_orbs.clear()
+                in_collection_phase = False
+                # after collecting, check leveling
+                leveled = False
+                while player_exp >= exp_required:
+                    player_exp -= exp_required
+                    player_level += 1
+                    leveled = True
+                    exp_required = 10 + 10 * (player_level - 1)
+                # if leveled, immediately open upgrade menu
+                if leveled:
+                    ability_choice_between_waves()
+                else:
+                    # still offer upgrades from pool even if not leveling? user requested upgrade when level up only.
+                    # So only open upgrade UI when leveled.
+                    pass
+                # after collection & possible upgrade, do 5 second visual countdown before next spawn
+                countdown_start = pygame.time.get_ticks()
+                countdown_end = countdown_start + 5000
+                while pygame.time.get_ticks() < countdown_end:
+                    remaining = int((countdown_end - pygame.time.get_ticks()) / 1000) + 1
+                    screen.fill(bg_color)
+                    txt = FONT_LG.render(f"Next Wave in {remaining}", True, BLACK)
+                    screen.blit(txt, (WIDTH//2 - txt.get_width()//2, HEIGHT//2 - txt.get_height()//2))
+                    draw_hp_bar(player_hp)
+                    draw_exp_bar()
+                    # draw pending orbs (none at this point)
+                    pygame.display.flip()
+                    for ev in pygame.event.get():
+                        if ev.type == pygame.QUIT:
+                            pygame.quit(); sys.exit()
+                    clock.tick(FPS)
+                # increment wave and spawn next
+                wave += 1
+                enemies_per_wave = max(1, int(round(enemies_per_wave * 1.1)))
+                if wave % 10 == 0:
+                    spawn_boss()
+                else:
+                    spawn_wave(enemies_per_wave)
+
+        # update floating texts
         for t in floating_texts[:]:
             t["y"] += t.get("vy", -0.5)
             t["ttl"] -= 1
@@ -900,14 +984,14 @@ def game_loop():
                 try: floating_texts.remove(t)
                 except ValueError: pass
 
-        # lightning update
+        # lightning visuals
         for L in lightning_lines[:]:
             L["ttl"] -= dt
             if L["ttl"] <= 0:
                 try: lightning_lines.remove(L)
                 except ValueError: pass
 
-        # small dots update
+        # small dots
         for d in small_dots[:]:
             d["y"] += d.get("vy", -0.2)
             d["ttl"] -= 1
@@ -943,14 +1027,21 @@ def game_loop():
             if enemy.poison_ms_left > 0:
                 pygame.draw.circle(screen, PURPLE, (enemy.rect.centerx - 10, enemy.rect.top + 8), 5)
 
-        # draw lightning lines
-        for L in lightning_lines:
-            pygame.draw.line(screen, YELLOW, (L["x1"], L["y1"]), (L["x2"], L["y2"]), 3)
+        # draw pending orbs (visible even during wave, but only collectible if in_collection_phase)
+        for orb in pending_orbs:
+            pygame.draw.rect(screen, BLUE, (orb["x"]-6, orb["y"]-6, 12, 12))
+            # small number on orb
+            txt = FONT_SM.render(str(orb["amount"]), True, BLACK)
+            screen.blit(txt, (orb["x"]-txt.get_width()//2, orb["y"]-txt.get_height()//2))
 
         # draw floating texts
         for t in floating_texts:
             surf = FONT_SM.render(t["txt"], True, t["color"])
             screen.blit(surf, (t["x"] - surf.get_width()//2, t["y"]))
+
+        # draw lightning
+        for L in lightning_lines:
+            pygame.draw.line(screen, YELLOW, (L["x1"], L["y1"]), (L["x2"], L["y2"]), 3)
 
         # draw small dots
         for d in small_dots:
@@ -962,6 +1053,7 @@ def game_loop():
             True, BLACK)
         screen.blit(hud, (12,56))
         draw_hp_bar(player_hp)
+        draw_exp_bar()
 
         # boss bar if present
         boss = None
@@ -979,12 +1071,21 @@ def game_loop():
             txt = FONT_SM.render(f"Boss HP: {int(boss.hp)}", True, BLACK)
             screen.blit(txt, (WIDTH//2 - txt.get_width()//2, y + 22))
 
-        # admin button (top-right) if unlocked for this game
+        # draw admin button if unlocked for this game
         if show_admin_button:
             admin_rect = draw_admin_button()
-            # small hint
             hint = FONT_SM.render("Admin (click)", True, BLACK)
             screen.blit(hint, (admin_rect.x + 12, admin_rect.y + 6))
+
+        # show collection UI during collection phase
+        if in_collection_phase:
+            # overlay small prompt
+            prompt = FONT_MD.render("Collection phase: Click blue squares to collect EXP (Space = collect all)", True, BLACK)
+            screen.blit(prompt, (WIDTH//2 - prompt.get_width()//2, HEIGHT//2 - 160))
+            # show remaining time
+            remaining = max(0, int((collection_start_ms + collection_duration_ms - now_ms)/1000) + 1)
+            t2 = FONT_LG.render(f"Collecting: {remaining}s", True, BLACK)
+            screen.blit(t2, (WIDTH//2 - t2.get_width()//2, HEIGHT//2 - 100))
 
         pygame.display.flip()
 
@@ -993,10 +1094,7 @@ def game_loop():
 # --- Program start ---
 if __name__ == "__main__":
     while True:
-        # reset everything fresh when returning to main menu
         reset_game()
-        # initial spawn for fresh run
         spawn_wave(enemies_per_wave := DEFAULTS["enemies_per_wave_start"])
         main_menu()
-        # if admin was unlocked in the menu, admin_available_next_game will be True
         game_loop()
