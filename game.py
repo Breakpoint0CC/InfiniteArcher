@@ -1,6 +1,7 @@
 # test.py
-# Infinite Archer - Final: menu buttons, options, admin, EXP orbs collectible only at end of wave
-# Run with: python test.py (requires pygame)
+# Infinite Archer - Final Final (red spawn squares fixed pattern, 5s preview, blue EXP orbs fly to player)
+# Run: python test.py
+# Requires pygame
 
 import pygame, random, math, sys, os, time
 
@@ -41,12 +42,13 @@ LIGHT_GRAY = (230,230,230)
 DARK_GRAY = (40,40,40)
 SKY_BLUE = (200,230,255)
 BLUE = (40,140,255)
+BROWN_RED = (120, 60, 20)
 
 FONT_LG = pygame.font.SysFont(None, 84)
 FONT_MD = pygame.font.SysFont(None, 44)
 FONT_SM = pygame.font.SysFont(None, 28)
 
-# --- Defaults for reset ---
+# --- Defaults ---
 DEFAULTS = {
     "player_size": 40,
     "player_speed": 5,
@@ -54,7 +56,6 @@ DEFAULTS = {
     "arrow_speed": 18,
     "arrow_damage": 20,
     "sword_damage": 40,
-    "sword_cooldown": 300,
     "sword_range": 120,
     "sword_arc_half_deg": 45,
     "base_knockback": 6,
@@ -63,23 +64,22 @@ DEFAULTS = {
     "archer_shot_damage": 10
 }
 
-# --- Global state reset function ---
+# --- State & reset function ---
 def reset_game():
     global player, player_speed, max_hp, player_hp
     global arrow_speed, arrow_damage, sword_damage
-    global sword_cooldown, sword_range, sword_arc_half, base_knockback, knockback_level
+    global sword_range, sword_arc_half, base_knockback, knockback_level
     global owned_abilities, pierce_level, pierce_max_level
     global enemies, arrows, enemy_arrows
     global wave, enemies_per_wave, score
     global floating_texts, lightning_lines, small_dots
-    global weapon
-    global bg_color, music_enabled
+    global weapon, bg_color, music_enabled
     global admin_unlocked, admin_available_next_game
     global player_level, player_exp, exp_required
     global pending_orbs, collected_exp_this_wave
     global in_collection_phase, collection_start_ms, collection_duration_ms
+    global spawn_pattern_positions, spawn_preview_ms, spawn_preview_active, spawn_preview_start_ms
 
-    # Player / combat
     player_size = DEFAULTS["player_size"]
     player = pygame.Rect(WIDTH//2 - player_size//2, HEIGHT//2 - player_size//2, player_size, player_size)
     player_speed = DEFAULTS["player_speed"]
@@ -89,13 +89,11 @@ def reset_game():
     arrow_speed = DEFAULTS["arrow_speed"]
     arrow_damage = DEFAULTS["arrow_damage"]
     sword_damage = DEFAULTS["sword_damage"]
-    sword_cooldown = DEFAULTS["sword_cooldown"]
     sword_range = DEFAULTS["sword_range"]
     sword_arc_half = math.radians(DEFAULTS["sword_arc_half_deg"])
     base_knockback = DEFAULTS["base_knockback"]
     knockback_level = 1
 
-    # abilities
     owned_abilities = {
         "Flame": False,
         "Poison": False,
@@ -106,14 +104,13 @@ def reset_game():
     pierce_level = 0
     pierce_max_level = 3
 
-    # containers
     enemies = []
     arrows = []
     enemy_arrows = []
 
-    floating_texts = []   # {x,y,txt,color,ttl,vy,alpha}
-    lightning_lines = []  # {x1,y1,x2,y2,ttl}
-    small_dots = []       # {x,y,color,ttl,vy}
+    floating_texts = []
+    lightning_lines = []
+    small_dots = []
 
     wave = 1
     enemies_per_wave = DEFAULTS["enemies_per_wave_start"]
@@ -121,34 +118,35 @@ def reset_game():
 
     weapon = "bow"
 
-    # UI / options defaults
     bg_color = WHITE
     music_enabled = False
 
-    # admin flags
     admin_unlocked = False
     admin_available_next_game = False
 
-    # EXP / leveling
     player_level = 1
     player_exp = 0
-    exp_required = 10 + 10 * (player_level - 1)  # level1 -> 10, level2 -> 20, etc.
+    exp_required = 10 + 10 * (player_level - 1)
 
-    # orbs (spawned on enemy death) — not applied until collection phase
-    pending_orbs = []  # list of dicts {x,y,amount,ttl}
+    pending_orbs = []
     collected_exp_this_wave = 0
 
-    # collection phase control
     in_collection_phase = False
     collection_start_ms = None
-    collection_duration_ms = 5000  # 5 seconds to collect
+    collection_duration_ms = 5000
 
-    # export
+    # spawn preview variables
+    # spawn pattern: FIXED set of random positions generated once per full game (same pattern reused)
+    spawn_pattern_positions = generate_spawn_pattern(120)  # create 120 possible spawn positions across screen
+    spawn_preview_ms = 5000  # red squares shown for 5 seconds before spawning
+    spawn_preview_active = False
+    spawn_preview_start_ms = None
+
     globals().update({
         "player": player, "player_speed": player_speed, "player_hp": player_hp, "max_hp": max_hp,
         "arrow_speed": arrow_speed, "arrow_damage": arrow_damage, "sword_damage": sword_damage,
-        "sword_cooldown": sword_cooldown, "sword_range": sword_range, "sword_arc_half": sword_arc_half,
-        "base_knockback": base_knockback, "knockback_level": knockback_level,
+        "sword_range": sword_range, "sword_arc_half": sword_arc_half, "base_knockback": base_knockback,
+        "knockback_level": knockback_level,
         "owned_abilities": owned_abilities, "pierce_level": pierce_level, "pierce_max_level": pierce_max_level,
         "enemies": enemies, "arrows": arrows, "enemy_arrows": enemy_arrows,
         "floating_texts": floating_texts, "lightning_lines": lightning_lines, "small_dots": small_dots,
@@ -158,15 +156,27 @@ def reset_game():
         "player_level": player_level, "player_exp": player_exp, "exp_required": exp_required,
         "pending_orbs": pending_orbs, "collected_exp_this_wave": collected_exp_this_wave,
         "in_collection_phase": in_collection_phase, "collection_start_ms": collection_start_ms,
-        "collection_duration_ms": collection_duration_ms
+        "collection_duration_ms": collection_duration_ms,
+        "spawn_pattern_positions": spawn_pattern_positions, "spawn_preview_ms": spawn_preview_ms,
+        "spawn_preview_active": spawn_preview_active, "spawn_preview_start_ms": spawn_preview_start_ms
     })
 
+# helper to generate fixed spawn pattern positions
+def generate_spawn_pattern(n):
+    positions = []
+    margin = 80
+    for _ in range(n):
+        x = random.randint(margin, WIDTH - margin)
+        y = random.randint(margin, HEIGHT - margin)
+        positions.append((x,y))
+    return positions
+
+# initial reset
 reset_game()
 
-# optional music file
 MUSIC_FILE = "music.mp3"
 
-# --- Helpers & draw functions ---
+# --- Visual helpers ---
 def draw_text_centered(font, text, y, color=BLACK):
     surf = font.render(text, True, color)
     screen.blit(surf, (WIDTH//2 - surf.get_width()//2, y))
@@ -179,7 +189,6 @@ def draw_hp_bar(hp):
     pygame.draw.rect(screen, BLACK, (x, y, w, h), 2)
 
 def draw_exp_bar():
-    # bottom of screen
     margin = 12
     w = WIDTH - margin*2
     h = 18
@@ -202,7 +211,7 @@ def draw_bow(player_rect):
     bottom = (player_rect.centerx + 4, player_rect.centery + int(bow_length * 0.9))
     pygame.draw.line(screen, BLACK, top, bottom, 2)
 
-# --- Enemy class & behaviors ---
+# --- Enemy class & archer support ---
 class Enemy:
     def __init__(self, rect, etype="normal", is_mini=False, hp_override=None):
         self.rect = rect
@@ -318,21 +327,18 @@ class EnemyArrow:
         pygame.draw.rect(surf, DARK_RED, self.rect)
 
 # --- Spawning & boss ---
-def spawn_wave(count):
+def spawn_wave_at_positions(positions):
     global enemies
     enemies = []
-    for _ in range(int(count)):
-        side = random.choice(["top","bottom","left","right"])
+    for pos in positions:
         etype = random.choices(["normal","fast","tank","archer"], weights=[50,30,10,10])[0]
-        if side == "top":
-            rect = pygame.Rect(random.randint(0, WIDTH-30), -40, 30, 30)
-        elif side == "bottom":
-            rect = pygame.Rect(random.randint(0, WIDTH-30), HEIGHT+40, 30, 30)
-        elif side == "left":
-            rect = pygame.Rect(-40, random.randint(0, HEIGHT-30), 30, 30)
-        else:
-            rect = pygame.Rect(WIDTH+40, random.randint(0, HEIGHT-30), 30, 30)
+        rect = pygame.Rect(pos[0]-15, pos[1]-15, 30, 30)
         enemies.append(Enemy(rect, etype))
+
+def spawn_wave(count):
+    # use the fixed spawn_pattern_positions: take first count positions
+    positions = spawn_pattern_positions[:int(count)]
+    spawn_wave_at_positions(positions)
 
 def spawn_boss():
     rect = pygame.Rect(WIDTH//2 - 60, -140, 120, 120)
@@ -372,13 +378,12 @@ def apply_lightning_chain(origin_enemy, base_damage):
             lightning_lines.append({"x1": ox, "y1": oy, "x2": e.rect.centerx, "y2": e.rect.centery, "ttl": 350})
             nearby += 1
 
-# --- Handle hits, deaths, orb drops ---
+# --- Orbs & drops ---
 def spawn_orb(x,y,amount=1):
-    # orb TTL while visible (just to fade if not collected before collection phase ends)
-    pending_orbs.append({"x": x, "y": y, "amount": amount, "ttl": 9999})
+    # orb appears immediately when enemy dies (visible), but only moves to player during collection phase
+    pending_orbs.append({"x": float(x), "y": float(y), "amount": amount, "vx":0.0, "vy":0.0, "collected":False})
 
 def handle_arrow_hit(enemy):
-    global score
     enemy.hp -= arrow_damage
     floating_texts.append({"x": enemy.rect.centerx, "y": enemy.rect.top - 12, "txt": f"-{arrow_damage}", "color": RED, "ttl": 60, "vy": -0.6, "alpha":255})
     now = pygame.time.get_ticks()
@@ -396,7 +401,6 @@ def handle_sword_attack(mx, my):
     global enemies, score
     kb = base_knockback * knockback_level
     angle_to_mouse = math.atan2(my - player.centery, mx - player.centerx)
-    hit_any = False
     for enemy in enemies[:]:
         ex = enemy.rect.centerx - player.centerx
         ey = enemy.rect.centery - player.centery
@@ -405,7 +409,6 @@ def handle_sword_attack(mx, my):
             enemy_angle = math.atan2(ey, ex)
             diff = abs((enemy_angle - angle_to_mouse + math.pi) % (2*math.pi) - math.pi)
             if diff <= sword_arc_half * 1.05:
-                hit_any = True
                 enemy.hp -= sword_damage
                 floating_texts.append({"x": enemy.rect.centerx, "y": enemy.rect.top - 12, "txt": f"-{sword_damage}", "color": RED, "ttl": 60, "vy": -0.6, "alpha":255})
                 if dist != 0:
@@ -421,10 +424,8 @@ def handle_sword_attack(mx, my):
                     lightning_lines.append({"x1": enemy.rect.centerx, "y1": enemy.rect.centery, "x2": enemy.rect.centerx, "y2": enemy.rect.centery, "ttl": 250})
                     apply_lightning_chain(enemy, sword_damage)
                 if enemy.hp <= 0:
-                    # when enemy dies, spawn orbs at its position
                     if getattr(enemy, "is_boss", False):
                         score += 25
-                        # boss orb amount: 10 + 10*(wave-1)
                         amt = 10 + 10 * (wave - 1)
                         spawn_orb(enemy.rect.centerx, enemy.rect.centery, amount=amt)
                     else:
@@ -434,9 +435,8 @@ def handle_sword_attack(mx, my):
                         enemies.remove(enemy)
                     except ValueError:
                         pass
-    return hit_any
 
-# --- Menus & secret typing (admin) ---
+# --- Menus & secret typing ---
 secret_sequence = "openadminpanel"
 secret_buffer = ""
 
@@ -448,7 +448,6 @@ def main_menu():
         draw_text_centered(FONT_LG, "Infinite Archer", HEIGHT//6)
         mx, my = pygame.mouse.get_pos()
 
-        # Buttons: Start, Options, Quit (clickable)
         btn_w = 360; btn_h = 70
         start_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 - 120, btn_w, btn_h)
         options_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 - 20, btn_w, btn_h)
@@ -502,7 +501,7 @@ def notify_once(msg, duration=1200):
                 pygame.quit(); sys.exit()
         clock.tick(FPS)
 
-# --- Options menu (keyboard) ---
+# --- Options menu ---
 def options_menu():
     global music_enabled, bg_color
     music_available = os.path.exists(MUSIC_FILE)
@@ -555,94 +554,7 @@ def options_menu():
                     bg_color = BLACK
         clock.tick(FPS)
 
-# --- Ability choice between waves (unchanged behavior) ---
-def ability_choice_between_waves():
-    global player_hp, arrow_damage, knockback_level, owned_abilities, pierce_level, player_level, player_exp
-    avail = []
-    if not owned_abilities.get("Flame", False): avail.append("Flame")
-    if not owned_abilities.get("Poison", False): avail.append("Poison")
-    if not owned_abilities.get("Lightning", False): avail.append("Lightning")
-    if knockback_level < 5: avail.append("Knockback")
-    if pierce_level < pierce_max_level: avail.append("Piercing")
-
-    if not avail:
-        pool = ["Heal +20 HP", "Damage +10"]
-    else:
-        pool = avail.copy()
-        pool.append("Heal +20 HP")
-        pool.append("Damage +10")
-
-    if len(pool) == 1:
-        choices = pool.copy()
-    else:
-        choices = random.sample(pool, min(2, len(pool)))
-
-    buttons = []
-    for i, c in enumerate(choices):
-        rect = pygame.Rect(WIDTH//2 - 220 + i*280, HEIGHT//2 - 50, 260, 80)
-        buttons.append((rect, c))
-
-    picking = True
-    while picking:
-        screen.fill(bg_color)
-        draw_text_centered(FONT_LG, "Choose an Upgrade", HEIGHT//2 - 160)
-        mx, my = pygame.mouse.get_pos()
-        for rect, label in buttons:
-            pygame.draw.rect(screen, LIGHT_GRAY, rect)
-            pygame.draw.rect(screen, BLACK, rect, 3)
-            display_label = label
-            if label == "Knockback": display_label = f"Knockback +1 (to {min(5, knockback_level+1)})"
-            if label == "Piercing": display_label = f"Piercing +1 (Lv {pierce_level+1})"
-            screen.blit(FONT_MD.render(display_label, True, BLACK), (rect.x+12, rect.y+18))
-        pygame.display.flip()
-        for ev in pygame.event.get():
-            if ev.type == pygame.QUIT:
-                pygame.quit(); sys.exit()
-            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-                for rect, label in buttons:
-                    if rect.collidepoint(mx,my):
-                        if label == "Heal +20 HP":
-                            player_hp = min(max_hp, player_hp + 20)
-                        elif label == "Damage +10":
-                            globals()["arrow_damage"] = globals().get("arrow_damage", DEFAULTS["arrow_damage"]) + 10
-                        elif label == "Flame":
-                            owned_abilities["Flame"] = True
-                        elif label == "Poison":
-                            owned_abilities["Poison"] = True
-                        elif label == "Lightning":
-                            owned_abilities["Lightning"] = True
-                        elif label == "Knockback":
-                            if knockback_level < 5:
-                                knockback_level += 1
-                            owned_abilities["Knockback"] = True
-                        elif label == "Piercing":
-                            if pierce_level < pierce_max_level:
-                                pierce_level += 1
-                            owned_abilities["Piercing"] = True
-                        picking = False
-            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
-                picking = False
-        clock.tick(FPS)
-
-# --- Game over screen ---
-def game_over_screen():
-    while True:
-        screen.fill(bg_color)
-        draw_text_centered(FONT_LG, "Game Over", HEIGHT//2 - 80)
-        draw_text_centered(FONT_MD, f"Score: {score}", HEIGHT//2 - 20)
-        draw_text_centered(FONT_MD, "Click or press Enter to return to menu", HEIGHT//2 + 40)
-        pygame.display.flip()
-        for ev in pygame.event.get():
-            if ev.type == pygame.QUIT:
-                pygame.quit(); sys.exit()
-            if ev.type == pygame.MOUSEBUTTONDOWN or (ev.type == pygame.KEYDOWN and ev.key == pygame.K_RETURN):
-                return
-        clock.tick(FPS)
-
-# initial spawn
-spawn_wave(enemies_per_wave := DEFAULTS["enemies_per_wave_start"])
-
-# --- Admin Panel (top-right button in-game; unlocked via secret) ---
+# --- Admin panel ---
 def draw_admin_button():
     rect = pygame.Rect(WIDTH - 160, 12, 148, 36)
     pygame.draw.rect(screen, LIGHT_GRAY, rect)
@@ -765,26 +677,114 @@ def admin_panel_overlay():
                 return
         clock.tick(FPS)
 
-# --- initial spawn call ensured earlier ---
+# --- Ability choice between waves ---
+def ability_choice_between_waves():
+    global player_hp, arrow_damage, knockback_level, owned_abilities, pierce_level
+    avail = []
+    if not owned_abilities.get("Flame", False): avail.append("Flame")
+    if not owned_abilities.get("Poison", False): avail.append("Poison")
+    if not owned_abilities.get("Lightning", False): avail.append("Lightning")
+    if knockback_level < 5: avail.append("Knockback")
+    if pierce_level < pierce_max_level: avail.append("Piercing")
+
+    if not avail:
+        pool = ["Heal +20 HP", "Damage +10"]
+    else:
+        pool = avail.copy()
+        pool.append("Heal +20 HP")
+        pool.append("Damage +10")
+
+    if len(pool) == 1:
+        choices = pool.copy()
+    else:
+        choices = random.sample(pool, min(2, len(pool)))
+
+    buttons = []
+    for i, c in enumerate(choices):
+        rect = pygame.Rect(WIDTH//2 - 220 + i*280, HEIGHT//2 - 50, 260, 80)
+        buttons.append((rect, c))
+
+    picking = True
+    while picking:
+        screen.fill(bg_color)
+        draw_text_centered(FONT_LG, "Choose an Upgrade", HEIGHT//2 - 160)
+        mx, my = pygame.mouse.get_pos()
+        for rect, label in buttons:
+            pygame.draw.rect(screen, LIGHT_GRAY, rect)
+            pygame.draw.rect(screen, BLACK, rect, 3)
+            display_label = label
+            if label == "Knockback": display_label = f"Knockback +1 (to {min(5, knockback_level+1)})"
+            if label == "Piercing": display_label = f"Piercing +1 (Lv {pierce_level+1})"
+            screen.blit(FONT_MD.render(display_label, True, BLACK), (rect.x+12, rect.y+18))
+        pygame.display.flip()
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                for rect, label in buttons:
+                    if rect.collidepoint(mx,my):
+                        if label == "Heal +20 HP":
+                            globals()["player_hp"] = min(globals().get("max_hp", DEFAULTS["max_hp"]), globals().get("player_hp", DEFAULTS["max_hp"]) + 20)
+                        elif label == "Damage +10":
+                            globals()["arrow_damage"] = globals().get("arrow_damage", DEFAULTS["arrow_damage"]) + 10
+                        elif label == "Flame":
+                            owned_abilities["Flame"] = True
+                        elif label == "Poison":
+                            owned_abilities["Poison"] = True
+                        elif label == "Lightning":
+                            owned_abilities["Lightning"] = True
+                        elif label == "Knockback":
+                            if knockback_level < 5:
+                                knockback_level += 1
+                            owned_abilities["Knockback"] = True
+                        elif label == "Piercing":
+                            if pierce_level < pierce_max_level:
+                                pierce_level += 1
+                            owned_abilities["Piercing"] = True
+                        picking = False
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                picking = False
+        clock.tick(FPS)
+
+# --- Game over screen ---
+def game_over_screen():
+    while True:
+        screen.fill(bg_color)
+        draw_text_centered(FONT_LG, "Game Over", HEIGHT//2 - 80)
+        draw_text_centered(FONT_MD, f"Score: {score}", HEIGHT//2 - 20)
+        draw_text_centered(FONT_MD, "Click or press Enter to return to menu", HEIGHT//2 + 40)
+        pygame.display.flip()
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if ev.type == pygame.MOUSEBUTTONDOWN or (ev.type == pygame.KEYDOWN and ev.key == pygame.K_RETURN):
+                return
+        clock.tick(FPS)
+
+# initial spawn placeholder (we spawn after preview)
 spawn_wave(enemies_per_wave)
 
-# --- Main game loop with collection phase & EXP logic ---
+# --- Main game loop (with spawn preview + orb flight) ---
 def game_loop():
     global weapon, arrows, enemies, enemy_arrows, wave, enemies_per_wave, score, player_hp
-    global last_sword_attack, pierce_level, admin_available_next_game, admin_unlocked
+    global pierce_level, admin_available_next_game, admin_unlocked
     global player_exp, player_level, exp_required, pending_orbs, collected_exp_this_wave
-    global in_collection_phase, collection_start_ms, collection_duration_ms, bg_color
+    global in_collection_phase, collection_start_ms, collection_duration_ms
+    global spawn_preview_active, spawn_preview_start_ms, spawn_preview_ms, spawn_pattern_positions, bg_color
 
-    last_sword_attack = -9999
     player.center = (WIDTH//2, HEIGHT//2)
+    last_sword_attack = -9999  # unused for no cooldown
 
-    # admin button shown this run if unlocked previously
     show_admin_button = False
     if admin_available_next_game:
         show_admin_button = True
         admin_available_next_game = False
 
     running = True
+    # If starting game, immediately show spawn preview for wave 1
+    spawn_preview_active = True
+    spawn_preview_start_ms = pygame.time.get_ticks()
+
     while running:
         dt = clock.tick(FPS)
         now_ms = pygame.time.get_ticks()
@@ -800,28 +800,26 @@ def game_loop():
                 if ev.key == pygame.K_2:
                     weapon = "sword"
                 if in_collection_phase:
-                    # SPACE collects all immediately
                     if ev.key == pygame.K_SPACE:
-                        # collect everything
+                        # collect all instantly
                         for orb in pending_orbs[:]:
                             player_exp += orb["amount"]
-                        collected_exp_this_wave = sum(o["amount"] for o in pending_orbs)
-                        pending_orbs.clear()
-                        # force exit collection phase (will trigger level check below)
+                            collected_exp_this_wave += orb["amount"]
+                            try: pending_orbs.remove(orb)
+                            except ValueError: pass
+                        # end collection
                         collection_start_ms = now_ms - collection_duration_ms - 1
             if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 mx,my = pygame.mouse.get_pos()
-                # admin open button
                 if show_admin_button:
                     admin_rect = pygame.Rect(WIDTH - 160, 12, 148, 36)
                     if admin_rect.collidepoint(mx,my):
                         admin_panel_overlay()
                         continue
-                # if in collection phase, allow clicking orbs to collect
                 if in_collection_phase:
+                    # allow clicking orbs to collect
                     for orb in pending_orbs[:]:
-                        ox, oy = orb["x"], orb["y"]
-                        rect = pygame.Rect(ox-8, oy-8, 16, 16)
+                        rect = pygame.Rect(orb["x"]-8, orb["y"]-8, 16, 16)
                         if rect.collidepoint(mx,my):
                             player_exp += orb["amount"]
                             collected_exp_this_wave += orb["amount"]
@@ -829,14 +827,11 @@ def game_loop():
                             except ValueError: pass
                             break
                     continue
-                # normal gameplay input
+                # normal actions
                 if weapon == "bow":
                     arrows.append(Arrow(player.centerx, player.centery, mx, my, pierce=pierce_level))
                 elif weapon == "sword":
-                    now_ms_local = pygame.time.get_ticks()
-                    if now_ms_local - last_sword_attack >= sword_cooldown:
-                        last_sword_attack = now_ms_local
-                        handle_sword_attack(mx, my)
+                    handle_sword_attack(mx, my)
 
         # movement
         keys = pygame.key.get_pressed()
@@ -846,6 +841,15 @@ def game_loop():
         if keys[pygame.K_d]: player.x += player_speed
         player.clamp_ip(screen.get_rect())
 
+        # spawn preview logic (show red squares for spawn_preview_ms then spawn)
+        if spawn_preview_active:
+            if now_ms - spawn_preview_start_ms >= spawn_preview_ms:
+                # spawn enemies at the preview positions (unless boss)
+                spawn_preview_active = False
+                if wave % 10 == 0:
+                    spawn_boss()
+                else:
+                    spawn_wave(enemies_per_wave)
         # update player arrows
         for a in arrows[:]:
             alive = a.update()
@@ -860,7 +864,7 @@ def game_loop():
                 try: enemy_arrows.remove(ea)
                 except ValueError: pass
 
-        # enemies logic
+        # enemies update
         for enemy in enemies[:]:
             if getattr(enemy, "is_boss", False):
                 boss_try_summon(enemy)
@@ -905,7 +909,7 @@ def game_loop():
                     game_over_screen()
                     return
 
-        # arrows hitting enemies (piercing)
+        # player arrows hitting enemies
         for a in arrows[:]:
             for enemy in enemies[:]:
                 if enemy.rect.colliderect(a.rect):
@@ -917,62 +921,60 @@ def game_loop():
                         except ValueError: pass
                         break
 
-        # --- Wave cleared: start collection phase ---
-        if not enemies and not in_collection_phase:
-            # start collecting: show pending orbs and allow collection for collection_duration_ms
+        # if no enemies and not already in collection phase and not in spawn preview: start collection
+        if not enemies and not in_collection_phase and not spawn_preview_active:
             in_collection_phase = True
             collection_start_ms = pygame.time.get_ticks()
             collected_exp_this_wave = 0
-            # center player
-            player.center = (WIDTH//2, HEIGHT//2)
+            # when collection starts, make pending orbs animate: set velocities toward player gradually
+            # we'll animate them in the loop
 
-        # handle collection phase timing & finish
+        # collection phase handling: animate orbs toward player, collect when close, and end after duration
         if in_collection_phase:
-            elapsed = now_ms - collection_start_ms
-            if elapsed >= collection_duration_ms:
-                # auto-collect remaining
+            # animate pending_orbs toward player (turn on attraction)
+            for orb in pending_orbs:
+                # compute vector toward player
+                dx = player.centerx - orb["x"]
+                dy = player.centery - orb["y"]
+                dist = math.hypot(dx,dy) or 1.0
+                # set a speed proportional to distance, capped
+                speed = 4 + min(8, dist / 20.0)
+                vx = (dx / dist) * speed
+                vy = (dy / dist) * speed
+                orb["x"] += vx
+                orb["y"] += vy
+                # auto-collect when overlapping player
+                if math.hypot(orb["x"] - player.centerx, orb["y"] - player.centery) < 20:
+                    player_exp += orb["amount"]
+                    collected_exp_this_wave += orb["amount"]
+                    try: pending_orbs.remove(orb)
+                    except ValueError: pass
+            # check timer end
+            if pygame.time.get_ticks() - collection_start_ms >= collection_duration_ms:
+                # auto-collect any remaining (if any)
                 for orb in pending_orbs[:]:
                     player_exp += orb["amount"]
                     collected_exp_this_wave += orb["amount"]
-                pending_orbs.clear()
+                    try: pending_orbs.remove(orb)
+                    except ValueError: pass
                 in_collection_phase = False
-                # after collecting, check leveling
+                # leveling logic
                 leveled = False
                 while player_exp >= exp_required:
                     player_exp -= exp_required
                     player_level += 1
                     leveled = True
                     exp_required = 10 + 10 * (player_level - 1)
-                # if leveled, immediately open upgrade menu
                 if leveled:
                     ability_choice_between_waves()
-                else:
-                    # still offer upgrades from pool even if not leveling? user requested upgrade when level up only.
-                    # So only open upgrade UI when leveled.
-                    pass
-                # after collection & possible upgrade, do 5 second visual countdown before next spawn
-                countdown_start = pygame.time.get_ticks()
-                countdown_end = countdown_start + 5000
-                while pygame.time.get_ticks() < countdown_end:
-                    remaining = int((countdown_end - pygame.time.get_ticks()) / 1000) + 1
-                    screen.fill(bg_color)
-                    txt = FONT_LG.render(f"Next Wave in {remaining}", True, BLACK)
-                    screen.blit(txt, (WIDTH//2 - txt.get_width()//2, HEIGHT//2 - txt.get_height()//2))
-                    draw_hp_bar(player_hp)
-                    draw_exp_bar()
-                    # draw pending orbs (none at this point)
-                    pygame.display.flip()
-                    for ev in pygame.event.get():
-                        if ev.type == pygame.QUIT:
-                            pygame.quit(); sys.exit()
-                    clock.tick(FPS)
-                # increment wave and spawn next
+                # After collection and upgrades (if leveled), show spawn preview for next wave (5s)
+                spawn_preview_active = True
+                spawn_preview_start_ms = pygame.time.get_ticks()
+                # center the player each wave
+                player.center = (WIDTH//2, HEIGHT//2)
+                # increment wave counting and enemies_per_wave growth
                 wave += 1
                 enemies_per_wave = max(1, int(round(enemies_per_wave * 1.1)))
-                if wave % 10 == 0:
-                    spawn_boss()
-                else:
-                    spawn_wave(enemies_per_wave)
 
         # update floating texts
         for t in floating_texts[:]:
@@ -1013,6 +1015,26 @@ def game_loop():
             tip_y = player.centery + sword_range * math.sin(angle)
             pygame.draw.line(screen, SILVER, (player.centerx, player.centery), (tip_x, tip_y), 8)
 
+        # draw red spawn preview squares if active (use first enemies_per_wave positions)
+        if spawn_preview_active:
+            preview_positions = spawn_pattern_positions[:int(enemies_per_wave)]
+            for pos in preview_positions:
+                rx, ry = pos
+                size = 34
+                rect = pygame.Rect(rx - size//2, ry - size//2, size, size)
+                # pulsate alpha
+                elapsed = (pygame.time.get_ticks() - spawn_preview_start_ms) / max(1, spawn_preview_ms)
+                pulse = 155 + int(100 * (0.5 + 0.5 * math.sin(elapsed * math.pi * 4)))
+                color = (200, 40, 40, pulse)
+                # draw filled rect with border
+                s = pygame.Surface((size, size), pygame.SRCALPHA)
+                s.fill((200, 40, 40, 120))
+                screen.blit(s, rect.topleft)
+                pygame.draw.rect(screen, RED, rect, 2)
+                # small X in center
+                pygame.draw.line(screen, RED, (rect.left+6, rect.top+6), (rect.right-6, rect.bottom-6), 2)
+                pygame.draw.line(screen, RED, (rect.right-6, rect.top+6), (rect.left+6, rect.bottom-6), 2)
+
         # draw arrows
         for a in arrows: a.draw(screen)
 
@@ -1027,12 +1049,11 @@ def game_loop():
             if enemy.poison_ms_left > 0:
                 pygame.draw.circle(screen, PURPLE, (enemy.rect.centerx - 10, enemy.rect.top + 8), 5)
 
-        # draw pending orbs (visible even during wave, but only collectible if in_collection_phase)
+        # draw pending orbs (always visible) - during collection they fly to player
         for orb in pending_orbs:
-            pygame.draw.rect(screen, BLUE, (orb["x"]-6, orb["y"]-6, 12, 12))
-            # small number on orb
+            pygame.draw.rect(screen, BLUE, (int(orb["x"])-6, int(orb["y"])-6, 12, 12))
             txt = FONT_SM.render(str(orb["amount"]), True, BLACK)
-            screen.blit(txt, (orb["x"]-txt.get_width()//2, orb["y"]-txt.get_height()//2))
+            screen.blit(txt, (int(orb["x"]) - txt.get_width()//2, int(orb["y"]) - txt.get_height()//2))
 
         # draw floating texts
         for t in floating_texts:
@@ -1071,18 +1092,16 @@ def game_loop():
             txt = FONT_SM.render(f"Boss HP: {int(boss.hp)}", True, BLACK)
             screen.blit(txt, (WIDTH//2 - txt.get_width()//2, y + 22))
 
-        # draw admin button if unlocked for this game
+        # admin button
         if show_admin_button:
             admin_rect = draw_admin_button()
             hint = FONT_SM.render("Admin (click)", True, BLACK)
             screen.blit(hint, (admin_rect.x + 12, admin_rect.y + 6))
 
-        # show collection UI during collection phase
+        # collection UI overlay
         if in_collection_phase:
-            # overlay small prompt
-            prompt = FONT_MD.render("Collection phase: Click blue squares to collect EXP (Space = collect all)", True, BLACK)
+            prompt = FONT_MD.render("Collection phase: Orbs fly to you (Space to collect all)", True, BLACK)
             screen.blit(prompt, (WIDTH//2 - prompt.get_width()//2, HEIGHT//2 - 160))
-            # show remaining time
             remaining = max(0, int((collection_start_ms + collection_duration_ms - now_ms)/1000) + 1)
             t2 = FONT_LG.render(f"Collecting: {remaining}s", True, BLACK)
             screen.blit(t2, (WIDTH//2 - t2.get_width()//2, HEIGHT//2 - 100))
@@ -1091,10 +1110,12 @@ def game_loop():
 
     return
 
-# --- Program start ---
+# --- Start ---
 if __name__ == "__main__":
     while True:
         reset_game()
-        spawn_wave(enemies_per_wave := DEFAULTS["enemies_per_wave_start"])
+        # initial preview start
+        spawn_preview_active = True
+        spawn_preview_start_ms = pygame.time.get_ticks()
         main_menu()
         game_loop()
