@@ -14,6 +14,10 @@
 # NOTE: Online requires: python -m pip install websockets
 
 import pygame, random, math, sys, os, json, time
+# Headless safe mode for server (no window needed)
+# Must be set before importing/initializing pygame display on Linux servers.
+if "--server" in sys.argv:
+    os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 import threading, asyncio
 try:
     import websockets
@@ -126,6 +130,7 @@ class NetClient:
         self.url = url
         self.id = None
         self.players = {}
+        self.enemies = {}
         self.connected = False
         self.last_error = ""
         self.last_status = "DISCONNECTED"
@@ -178,6 +183,9 @@ class NetClient:
                         elif data.get("type") == "state":
                             with self._lock:
                                 self.players = data.get("players", {})
+                        elif data.get("type") == "enemies":
+                            with self._lock:
+                                self.enemies = {str(e.get("id")): e for e in data.get("enemies", [])}
             except Exception as e:
                 self.connected = False
                 self._ws = None
@@ -194,7 +202,16 @@ class NetClient:
     def send_input(self, x, y, weapon):
         if not self.connected or self._ws is None or self._loop is None:
             return
-        payload = {"type": "input", "x": float(x), "y": float(y), "weapon": weapon}
+        payload = {"type": "input", "x": float(x), "y": float(y), "weapon": weapon, "name": str(ONLINE_USERNAME)}
+        try:
+            asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(payload)), self._loop)
+        except Exception as e:
+            self.last_error = str(e)
+
+    def send_hit(self, enemy_id, dmg):
+        if not self.connected or self._ws is None or self._loop is None:
+            return
+        payload = {"type": "hit", "enemy_id": str(enemy_id), "dmg": float(dmg)}
         try:
             asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(payload)), self._loop)
         except Exception as e:
@@ -204,6 +221,10 @@ class NetClient:
         with self._lock:
             return dict(self.players)
 
+    def get_enemies(self):
+        with self._lock:
+            return dict(self.enemies)
+
 async def run_server(host="0.0.0.0", port=8765, tick_hz=20):
     if websockets is None:
         print("websockets not installed. Run: python -m pip install websockets")
@@ -211,11 +232,42 @@ async def run_server(host="0.0.0.0", port=8765, tick_hz=20):
 
     import uuid, time as _time
     players = {}
+    enemies = {}
+    wave = 1
+    enemies_per_wave = 5
+    next_enemy_id = 1
     connected = set()
+
+    def spawn_wave():
+        nonlocal enemies, next_enemy_id, wave, enemies_per_wave
+        enemies = {}
+        n = int(enemies_per_wave)
+        for _ in range(n):
+            eid = str(next_enemy_id); next_enemy_id += 1
+            etype = random.choices(["normal", "fast", "tank", "archer"], weights=[50, 30, 10, 10])[0]
+            # spawn around edges
+            side = random.choice(["top", "bottom", "left", "right"])
+            if side == "top":
+                x, y = random.randint(80, 1200), -40
+            elif side == "bottom":
+                x, y = random.randint(80, 1200), 900
+            elif side == "left":
+                x, y = -40, random.randint(80, 700)
+            else:
+                x, y = 1400, random.randint(80, 700)
+
+            if etype == "normal": hp, spd = 40, 2.0
+            elif etype == "fast": hp, spd = 30, 3.0
+            elif etype == "tank": hp, spd = 80, 1.2
+            else: hp, spd = 36, 2.0
+
+            enemies[eid] = {"id": eid, "x": float(x), "y": float(y), "w": 30, "h": 30, "hp": float(hp), "etype": etype, "spd": float(spd)}
+
+    spawn_wave()
 
     async def handler(ws):
         pid = uuid.uuid4().hex[:8]
-        players[pid] = {"x": 300.0, "y": 300.0, "weapon": "bow", "last": _time.time()}
+        players[pid] = {"x": 300.0, "y": 300.0, "weapon": "bow", "name": "Player", "last": _time.time()}
         connected.add(ws)
         await ws.send(json.dumps({"type": "hello", "id": pid}))
         try:
@@ -234,6 +286,15 @@ async def run_server(host="0.0.0.0", port=8765, tick_hz=20):
                         p["y"] = float(data["y"])
                     if "weapon" in data:
                         p["weapon"] = data["weapon"]
+                    if "name" in data and str(data["name"]).strip():
+                        p["name"] = str(data["name"])[:16]
+                elif data.get("type") == "hit":
+                    eid = str(data.get("enemy_id"))
+                    dmg = float(data.get("dmg", 0))
+                    if eid in enemies and dmg > 0:
+                        enemies[eid]["hp"] -= dmg
+                        if enemies[eid]["hp"] <= 0:
+                            enemies.pop(eid, None)
         finally:
             players.pop(pid, None)
             try:
@@ -243,12 +304,43 @@ async def run_server(host="0.0.0.0", port=8765, tick_hz=20):
 
     async def tick_loop():
         while True:
+            # Simulate enemies toward closest player (server-authoritative enemies)
+            if players:
+                # pick a representative target per enemy: closest player
+                plist = list(players.values())
+                for e in list(enemies.values()):
+                    ex = e["x"] + e["w"] / 2
+                    ey = e["y"] + e["h"] / 2
+                    best = None
+                    bestd = 1e18
+                    for p in plist:
+                        dx = float(p["x"]) - ex
+                        dy = float(p["y"]) - ey
+                        d = dx * dx + dy * dy
+                        if d < bestd:
+                            bestd = d
+                            best = p
+                    if best is not None:
+                        dx = float(best["x"]) - ex
+                        dy = float(best["y"]) - ey
+                        dist = math.hypot(dx, dy) or 1.0
+                        spd = float(e.get("spd", 2.0))
+                        e["x"] += (dx / dist) * spd
+                        e["y"] += (dy / dist) * spd
+
+            # If all enemies are dead, next wave
+            if not enemies:
+                wave += 1
+                enemies_per_wave = max(1, int(round(enemies_per_wave * 1.10)))
+                spawn_wave()
+
             if connected:
-                payload = json.dumps({"type": "state", "players": players})
                 try:
-                    websockets.broadcast(connected, payload)
+                    websockets.broadcast(connected, json.dumps({"type": "state", "players": players}))
+                    websockets.broadcast(connected, json.dumps({"type": "enemies", "enemies": list(enemies.values())}))
                 except Exception:
                     pass
+
             await asyncio.sleep(1.0 / float(tick_hz))
 
     async with websockets.serve(handler, host, port, ping_interval=20, ping_timeout=20, max_size=2_000_000):
@@ -511,10 +603,13 @@ admin_unlocked = False
 admin_available_next_game = False
 bg_color = WHITE
 
+ONLINE_USERNAME = os.environ.get("IA_NAME", "Player")
 # Online (MVP) state
 online_mode = False
 net = None
 net_players_cache = {}
+online_coop_enemies = True  # when online, use server-authoritative enemies
+net_enemies_cache = {}
 
 # Save-slot meta shown in menus (instant gems display)
 slot_meta_cache = {
@@ -691,6 +786,7 @@ def reset_game():
 
     # Online client (MVP)
     net_players_cache = {}
+    globals()["net_enemies_cache"] = {}
     if online_mode and websockets is not None:
         url = os.environ.get("IA_SERVER", "ws://localhost:8765")
         net = NetClient(url)
@@ -1419,6 +1515,23 @@ def game_loop():
         if online_mode and net is not None:
             net.send_input(player.centerx, player.centery, weapon)
             net_players_cache = net.get_players()
+            if online_coop_enemies:
+                net_enemies_cache = net.get_enemies()
+
+        # Server-authoritative enemies (true co-op MVP)
+        if online_mode and online_coop_enemies and net is not None:
+            # If we have server enemies, mirror them into local `enemies` list for drawing/collisions
+            if net_enemies_cache:
+                enemies.clear()
+                for eid, ed in net_enemies_cache.items():
+                    try:
+                        r = pygame.Rect(int(ed.get("x", 0)), int(ed.get("y", 0)), int(ed.get("w", 30)), int(ed.get("h", 30)))
+                        obj = Enemy(r, str(ed.get("etype", "normal")))
+                        obj.hp = float(ed.get("hp", 1))
+                        obj._net_id = str(eid)
+                        enemies.append(obj)
+                    except Exception:
+                        continue
 
         # spawn preview
         if spawn_preview_active:
@@ -1499,7 +1612,10 @@ def game_loop():
         for a in arrows[:]:
             for enemy in enemies[:]:
                 if enemy.rect.colliderect(a.rect):
-                    handle_arrow_hit(enemy)
+                    if online_mode and online_coop_enemies and net is not None and hasattr(enemy, "_net_id"):
+                        net.send_hit(enemy._net_id, globals().get("arrow_damage", DEFAULTS["arrow_damage"]))
+                    else:
+                        handle_arrow_hit(enemy)
                     if getattr(a, "pierce_remaining", 0) > 0:
                         a.pierce_remaining -= 1
                     else:
@@ -1618,7 +1734,8 @@ def game_loop():
                     continue
                 r = pygame.Rect(rx - player.width // 2, ry - player.height // 2, player.width, player.height)
                 pygame.draw.rect(screen, (60, 160, 255), r)
-                tag = FONT_SM.render(f"P:{pid}", True, BLACK)
+                nm = str(p.get("name", pid))
+                tag = FONT_SM.render(nm, True, BLACK)
                 screen.blit(tag, (r.x, r.y - 18))
 
         # weapon visuals (blue bow for Mad Scientist)
@@ -1753,6 +1870,15 @@ def game_loop():
 
 # ---------- ENTRY ----------
 if __name__ == "__main__":
+    # CLI args (simple)
+    if "--name" in sys.argv:
+        try:
+            i = sys.argv.index("--name")
+            if i + 1 < len(sys.argv):
+                ONLINE_USERNAME = sys.argv[i + 1]
+        except Exception:
+            pass
+
     # server mode
     if "--server" in sys.argv:
         if websockets is None:
