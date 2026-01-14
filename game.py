@@ -25,7 +25,13 @@ pygame.init()
 # ---------- CONFIG ----------
 FULLSCREEN = True
 DEFAULT_WIDTH, DEFAULT_HEIGHT = 1280, 800
-SAVE_FILE = "save.json"
+SAVE_SLOTS = ["save1.json", "save2.json", "save3.json"]
+current_save_slot = 1  # 1..3
+
+def get_save_path(slot=None):
+    s = current_save_slot if slot is None else int(slot)
+    s = max(1, min(3, s))
+    return SAVE_SLOTS[s - 1]
 
 if FULLSCREEN:
     screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
@@ -479,6 +485,37 @@ online_mode = False
 net = None
 net_players_cache = {}
 
+# Save-slot meta shown in menus (instant gems display)
+slot_meta_cache = {
+    1: {"gems": 0, "player_class": "No Class"},
+    2: {"gems": 0, "player_class": "No Class"},
+    3: {"gems": 0, "player_class": "No Class"},
+}
+
+def load_slot_meta(slot):
+    """Lightweight read for menu display (gems/class) without loading full state."""
+    path = get_save_path(slot)
+    if not os.path.exists(path):
+        slot_meta_cache[int(slot)] = {"gems": 0, "player_class": "No Class"}
+        return slot_meta_cache[int(slot)]
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        meta = {
+            "gems": int(data.get("gems", 0)),
+            "player_class": str(data.get("player_class", "No Class")),
+        }
+        slot_meta_cache[int(slot)] = meta
+        return meta
+    except Exception:
+        slot_meta_cache[int(slot)] = {"gems": 0, "player_class": "No Class"}
+        return slot_meta_cache[int(slot)]
+
+
+def refresh_all_slot_meta():
+    for s in (1, 2, 3):
+        load_slot_meta(s)
+
 # ---------- Save / Load ----------
 def save_game():
     try:
@@ -499,8 +536,9 @@ def save_game():
             "enemies_per_wave": globals().get("enemies_per_wave", DEFAULTS["enemies_per_wave_start"]),
             "player_class": player_class.name if 'player_class' in globals() else "No Class",
         }
-        with open(SAVE_FILE, "w") as f:
+        with open(get_save_path(), "w") as f:
             json.dump(data, f)
+            load_slot_meta(current_save_slot)
     except Exception as e:
         print("Save failed:", e)
 
@@ -509,10 +547,10 @@ def load_game():
     global wave, score, gems, pierce_level, knockback_level, owned_abilities, corrosive_level
     global enemies_per_wave, player_class
 
-    if not os.path.exists(SAVE_FILE):
+    if not os.path.exists(get_save_path()):
         return False
     try:
-        with open(SAVE_FILE, "r") as f:
+        with open(get_save_path(), "r") as f:
             data = json.load(f)
 
         px, py, w, h = data.get("player", [WIDTH // 2, HEIGHT // 2, 40, 40])
@@ -603,7 +641,10 @@ def reset_game():
     player_level = 1
     player_exp = 0
     exp_required = 10 + 10 * (player_level - 1)
-    gems = 0
+
+    # Keep gems per save-slot (menu shows instantly; new game doesn't wipe gems)
+    meta = load_slot_meta(current_save_slot)
+    gems = int(meta.get("gems", 0))
 
     in_collection_phase = False
     collection_start_ms = None
@@ -1087,6 +1128,7 @@ def class_shop_menu():
                             gems -= cost
                             player_class = cls()
                             save_game()
+                            load_slot_meta(current_save_slot)
                             notify_once(f"{cls.name} Selected!", 800)
                             return
                         else:
@@ -1100,17 +1142,27 @@ def main_menu():
     secret_sequence = "openadminpanel"
     secret_buffer = ""
 
+    refresh_all_slot_meta()
+
     while True:
         screen.fill(bg_color)
         draw_text_centered(FONT_LG, "Infinite Archer", HEIGHT // 6)
         mx, my = pygame.mouse.get_pos()
 
         btn_w, btn_h = 360, 70
-        new_rect = pygame.Rect(WIDTH // 2 - btn_w // 2, HEIGHT // 2 - 120, btn_w, btn_h)
-        resume_rect = pygame.Rect(WIDTH // 2 - btn_w // 2, HEIGHT // 2 - 20, btn_w, btn_h)
-        quit_rect = pygame.Rect(WIDTH // 2 - btn_w // 2, HEIGHT // 2 + 80, btn_w, btn_h)
-        class_rect = pygame.Rect(WIDTH // 2 - btn_w // 2, HEIGHT // 2 + 180, btn_w, btn_h)
-        online_rect = pygame.Rect(WIDTH // 2 - btn_w // 2, HEIGHT // 2 + 280, btn_w, btn_h)
+        new_rect = pygame.Rect(WIDTH // 2 - btn_w // 2, HEIGHT // 2 - 140, btn_w, btn_h)
+        resume_rect = pygame.Rect(WIDTH // 2 - btn_w // 2, HEIGHT // 2 - 40, btn_w, btn_h)
+        quit_rect = pygame.Rect(WIDTH // 2 - btn_w // 2, HEIGHT // 2 + 60, btn_w, btn_h)
+        class_rect = pygame.Rect(WIDTH // 2 - btn_w // 2, HEIGHT // 2 + 160, btn_w, btn_h)
+        online_rect = pygame.Rect(WIDTH // 2 - btn_w // 2, HEIGHT // 2 + 260, btn_w, btn_h)
+
+        # Save slots row
+        slot_y = HEIGHT // 2 + 360
+        slot_w = 180
+        slot_h = 60
+        slot1_rect = pygame.Rect(WIDTH // 2 - slot_w - 200, slot_y, slot_w, slot_h)
+        slot2_rect = pygame.Rect(WIDTH // 2 - slot_w // 2, slot_y, slot_w, slot_h)
+        slot3_rect = pygame.Rect(WIDTH // 2 + 200, slot_y, slot_w, slot_h)
 
         for rect, label in [(new_rect, "Create New Game"), (resume_rect, "Resume Game"), (quit_rect, "Quit")]:
             color = LIGHT_GRAY if rect.collidepoint(mx, my) else (220, 220, 220)
@@ -1127,7 +1179,10 @@ def main_menu():
         online_label = "Online (MVP)" if websockets is not None else "Online (pip install websockets)"
         screen.blit(FONT_MD.render(online_label, True, BLACK), (online_rect.x + 18, online_rect.y + 18))
 
-        gem_txt = FONT_MD.render(f"Gems: {gems}", True, BLUE)
+        # Gems shown are from current save-slot (instant)
+        meta_now = load_slot_meta(current_save_slot)
+        gems = int(meta_now.get("gems", gems))
+        gem_txt = FONT_MD.render(f"Gems: {gems}  (Slot {current_save_slot})", True, BLUE)
         screen.blit(gem_txt, (WIDTH - gem_txt.get_width() - 22, 18))
 
         # current class display
@@ -1145,6 +1200,19 @@ def main_menu():
             m = FONT_SM.render("Admin unlocked — will appear next game", True, (150, 0, 50))
             screen.blit(m, (WIDTH // 2 - m.get_width() // 2, HEIGHT // 2 - 180))
 
+        # Save slot buttons
+        for s, r in [(1, slot1_rect), (2, slot2_rect), (3, slot3_rect)]:
+            meta = load_slot_meta(s)
+            is_sel = (s == current_save_slot)
+            fill = LIGHT_GRAY if r.collidepoint(mx, my) else (220, 220, 220)
+            pygame.draw.rect(screen, fill, r)
+            pygame.draw.rect(screen, BLUE if is_sel else BLACK, r, 4 if is_sel else 3)
+            label = f"Slot {s}: {int(meta.get('gems', 0))}"
+            screen.blit(FONT_MD.render(label, True, BLACK), (r.x + 14, r.y + 14))
+
+        slot_hint = FONT_SM.render("Pick a save slot (gems are separate per slot)", True, (60, 60, 60))
+        screen.blit(slot_hint, (WIDTH // 2 - slot_hint.get_width() // 2, slot_y + 72))
+
         pygame.display.flip()
 
         for ev in pygame.event.get():
@@ -1152,6 +1220,20 @@ def main_menu():
                 save_game(); pygame.quit(); sys.exit()
 
             if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                # Save slot selection
+                if slot1_rect.collidepoint(ev.pos):
+                    globals()["current_save_slot"] = 1
+                    notify_once("Selected Slot 1", 500)
+                    continue
+                if slot2_rect.collidepoint(ev.pos):
+                    globals()["current_save_slot"] = 2
+                    notify_once("Selected Slot 2", 500)
+                    continue
+                if slot3_rect.collidepoint(ev.pos):
+                    globals()["current_save_slot"] = 3
+                    notify_once("Selected Slot 3", 500)
+                    continue
+
                 if new_rect.collidepoint(ev.pos):
                     online_mode = False
                     reset_game()
@@ -1581,10 +1663,13 @@ def game_loop():
         )
         screen.blit(hud, (12, 56))
 
+        # Always show mode status
         if online_mode:
             st = "ONLINE" if (net is not None and net.connected) else "CONNECTING"
             sid = net.id if (net is not None and net.id) else "?"
-            screen.blit(FONT_SM.render(f"{st}  ID:{sid}", True, BLUE), (12, 84))
+            screen.blit(FONT_SM.render(f"MODE: ONLINE ({st})  ID:{sid}", True, BLUE), (12, 84))
+        else:
+            screen.blit(FONT_SM.render("MODE: OFFLINE", True, (90, 90, 90)), (12, 84))
 
         # in-game Save button
         save_btn = pygame.Rect(WIDTH - 120, HEIGHT - 60, 100, 40)
@@ -1636,7 +1721,10 @@ if __name__ == "__main__":
 
     reset_game()
     while True:
-        main_menu()
+        choice = main_menu()
+        if choice == "resume":
+            # already loaded inside main_menu
+            pass
         spawn_preview_active = True
         spawn_preview_start_ms = pygame.time.get_ticks()
         game_loop()
