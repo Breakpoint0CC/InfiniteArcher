@@ -127,6 +127,9 @@ class NetClient:
         self.id = None
         self.players = {}
         self.connected = False
+        self.last_error = ""
+        self.last_status = "DISCONNECTED"
+        self.last_hello_ms = 0
         self._loop = None
         self._ws = None
         self._lock = threading.Lock()
@@ -142,23 +145,51 @@ class NetClient:
     async def _main(self):
         if websockets is None:
             self.connected = False
+            self.last_status = "NO_WEBSOCKETS"
+            self.last_error = "websockets package not installed"
             return
-        try:
-            async with websockets.connect(self.url, ping_interval=20, ping_timeout=20, max_size=2_000_000) as ws:
-                self._ws = ws
-                self.connected = True
-                async for msg in ws:
-                    try:
-                        data = json.loads(msg)
-                    except Exception:
-                        continue
-                    if data.get("type") == "hello":
-                        self.id = data.get("id")
-                    elif data.get("type") == "state":
-                        with self._lock:
-                            self.players = data.get("players", {})
-        except Exception:
-            self.connected = False
+
+        # Reconnect loop
+        while True:
+            try:
+                self.last_status = "CONNECTING"
+                self.last_error = ""
+                async with websockets.connect(
+                    self.url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    max_size=2_000_000,
+                    open_timeout=6,
+                    close_timeout=3,
+                ) as ws:
+                    self._ws = ws
+                    self.connected = True
+                    self.last_status = "CONNECTED"
+                    # Wait for messages; server should send hello immediately
+                    async for msg in ws:
+                        try:
+                            data = json.loads(msg)
+                        except Exception:
+                            continue
+                        if data.get("type") == "hello":
+                            self.id = data.get("id")
+                            self.last_hello_ms = pygame.time.get_ticks()
+                            self.last_status = "ONLINE"
+                        elif data.get("type") == "state":
+                            with self._lock:
+                                self.players = data.get("players", {})
+            except Exception as e:
+                self.connected = False
+                self._ws = None
+                # keep id if you want; but show clearly we're not online
+                if not self.id:
+                    self.last_status = "DISCONNECTED"
+                else:
+                    self.last_status = "RECONNECTING"
+                self.last_error = str(e)
+
+            # backoff before retry
+            await asyncio.sleep(1.0)
 
     def send_input(self, x, y, weapon):
         if not self.connected or self._ws is None or self._loop is None:
@@ -166,8 +197,8 @@ class NetClient:
         payload = {"type": "input", "x": float(x), "y": float(y), "weapon": weapon}
         try:
             asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(payload)), self._loop)
-        except Exception:
-            pass
+        except Exception as e:
+            self.last_error = str(e)
 
     def get_players(self):
         with self._lock:
@@ -1665,9 +1696,20 @@ def game_loop():
 
         # Always show mode status
         if online_mode:
-            st = "ONLINE" if (net is not None and net.connected) else "CONNECTING"
-            sid = net.id if (net is not None and net.id) else "?"
-            screen.blit(FONT_SM.render(f"MODE: ONLINE ({st})  ID:{sid}", True, BLUE), (12, 84))
+            url = os.environ.get("IA_SERVER", "ws://localhost:8765")
+            if net is None:
+                screen.blit(FONT_SM.render(f"MODE: ONLINE (NO CLIENT)  URL:{url}", True, BLUE), (12, 84))
+            else:
+                sid = net.id if net.id else "?"
+                st = getattr(net, "last_status", "CONNECTING")
+                screen.blit(FONT_SM.render(f"MODE: ONLINE ({st})  ID:{sid}", True, BLUE), (12, 84))
+                screen.blit(FONT_SM.render(f"URL: {url}", True, (30, 110, 220)), (12, 108))
+                # show last error only if not online
+                if st not in ("ONLINE",) and getattr(net, "last_error", ""):
+                    err = net.last_error
+                    if len(err) > 80:
+                        err = err[:80] + "…"
+                    screen.blit(FONT_SM.render(f"NET ERR: {err}", True, (180, 60, 60)), (12, 132))
         else:
             screen.blit(FONT_SM.render("MODE: OFFLINE", True, (90, 90, 90)), (12, 84))
 
