@@ -844,6 +844,16 @@ class MadScientist(PlayerClass):
                 try: enemies.remove(closest)
                 except: pass
 
+class Robber(PlayerClass):
+    """Secret class: 5 guns. Unlock by clicking Gems in class shop with >= 15000 gems. Replaces bow."""
+    name = "Robber"
+    color = (80, 60, 40)  # dark tan
+    rarity_tier = "Secret"
+    def on_arrow_fire(self, mx, my):
+        return True  # Robber uses guns, not bow; firing handled in game loop
+    def try_deflect(self, enemy_arrow):
+        return False
+
 class Knight(PlayerClass):
     name = "Knight"
     color = (180,180,180)
@@ -912,6 +922,7 @@ PLAYER_CLASS_ORDER = [
     Vampire,
     Assassin,
     MadScientist,
+    Robber,
 ]
 
 CLASS_COSTS = {
@@ -924,9 +935,15 @@ CLASS_COSTS = {
     "Vampire": 4000,
     "Assassin": 5500,
     "Mad Scientist": 10000,
+    "Robber": 15000,
 }
 
+ROBBER_GEM_COST = 15000
+ROBBER_MIN_GEMS_TO_SHOW = 15000
+
 def class_rarity_label(cls_name):
+    if cls_name == "Robber":
+        return "Secret"
     if cls_name == "Mad Scientist":
         return "Advanced"
     if cls_name in ("Knight", "Ranger", "Vampire", "Assassin"):
@@ -957,6 +974,30 @@ assassin_active_bounties = []
 assassin_bounty_refresh_at_ms = 0
 assassin_kills = {"normal": 0, "fast": 0, "tank": 0, "archer": 0, "boss": 0}
 assassin_completed_bounties = set()
+
+# Robber class: 5 guns (replaces bow)
+robbers_gun = "ak47"
+ROBBER_AK_INTERVAL_MS = 111   # 3x faster than ~333ms bow click = ~9/sec
+ROBBER_MINIGUN_CHARGE_MS = 1670
+ROBBER_MINIGUN_FIRE_DURATION_MS = 13142   # 13.141592653s
+ROBBER_MINIGUN_BULLETS_PER_SEC = 10
+ROBBER_MINIGUN_OVERHEAT_MS = 6767
+ROBBER_MINIGUN_DAMAGE_MULT = 1.0 / 3.0
+ROBBER_SHOTGUN_PELLETS = 5
+ROBBER_FLAME_TICK_MS = 100
+ROBBER_FLAME_BURN_MS = 5000
+ROBBER_FLAME_CONE_RANGE = 200
+ROBBER_FLAME_CONE_ANGLE_RAD = math.radians(120)
+ROBBER_FLAME_DMG_PER_TICK = 0.2   # fraction of arrow_damage per tick
+ROBBER_SNIPER_INTERVAL_MS = 3142  # 3.141592653s
+ROBBER_SNIPER_DAMAGE_MULT = 6.0
+last_robber_ak_ms = 0
+minigun_charge_start_ms = 0
+minigun_firing_until_ms = 0
+minigun_overheat_until_ms = 0
+minigun_last_bullet_ms = 0
+last_robber_sniper_ms = 0
+last_robber_flame_tick_ms = 0
 
 # ---------- CHAT (client + offline) ----------
 chat_open = False
@@ -1108,6 +1149,7 @@ def draw_chat(surface):
 
 admin_unlocked = False
 admin_available_next_game = False
+admin_god_mode = False  # when True, player takes no damage (admin panel toggle)
 bg_color = WHITE
 
 # save-slot meta shown in menus (from meta file; persists across New Game)
@@ -1443,6 +1485,14 @@ def reset_game():
     enemies_per_wave = DEFAULTS["enemies_per_wave_start"]
     score = 0
     weapon = "bow"
+    robbers_gun = "ak47"
+    globals()["last_robber_ak_ms"] = 0
+    globals()["minigun_charge_start_ms"] = 0
+    globals()["minigun_firing_until_ms"] = 0
+    globals()["minigun_overheat_until_ms"] = 0
+    globals()["minigun_last_bullet_ms"] = 0
+    globals()["last_robber_sniper_ms"] = 0
+    globals()["last_robber_flame_tick_ms"] = 0
 
     player_level = 1
     player_exp = 0
@@ -2108,6 +2158,100 @@ def shoot_bow(mx, my):
         if online_mode and net is not None:
             net.send_shoot(player.centerx, player.centery, a.vx, a.vy)
 
+def spawn_robber_bullet(mx, my, damage_mult=1.0, spread_deg=0):
+    """Spawn one bullet (Arrow with damage_override) for Robber guns."""
+    dx = mx - player.centerx
+    dy = my - player.centery
+    if spread_deg:
+        ang = math.atan2(dy, dx) + math.radians(random.uniform(-spread_deg, spread_deg))
+        dist = math.hypot(dx, dy) or 1.0
+        tx = player.centerx + dist * math.cos(ang)
+        ty = player.centery + dist * math.sin(ang)
+    else:
+        tx, ty = mx, my
+    a = Arrow(player.centerx, player.centery, tx, ty, pierce=0)
+    a.damage_override = max(1, int(arrow_damage * damage_mult))
+    arrows.append(a)
+
+def update_robber_guns(now_ms, mx, my, mouse_held, clicked):
+    """Handle Robber gun firing: AK (hold), minigun (charge then auto), shotgun (click), flamethrower (hold), sniper (slow)."""
+    global last_robber_ak_ms, minigun_charge_start_ms, minigun_firing_until_ms, minigun_overheat_until_ms, minigun_last_bullet_ms
+    global last_robber_sniper_ms, last_robber_flame_tick_ms
+    gun = robbers_gun
+    # --- AK-47: automatic, 3x bow rate, hold to fire ---
+    if gun == "ak47":
+        if mouse_held and now_ms - last_robber_ak_ms >= ROBBER_AK_INTERVAL_MS:
+            last_robber_ak_ms = now_ms
+            play_sound("arrow")
+            spawn_robber_bullet(mx, my, 1.0)
+        return
+    # --- Minigun: charge 1.67s, then 10 bullets/sec for 13.14s, then overheat 6.77s ---
+    if gun == "minigun":
+        if minigun_overheat_until_ms and now_ms >= minigun_overheat_until_ms:
+            minigun_overheat_until_ms = 0
+        if minigun_firing_until_ms and now_ms >= minigun_firing_until_ms:
+            minigun_firing_until_ms = 0
+            minigun_overheat_until_ms = now_ms + ROBBER_MINIGUN_OVERHEAT_MS
+        if minigun_firing_until_ms and now_ms < minigun_firing_until_ms:
+            if now_ms - minigun_last_bullet_ms >= 1000 // ROBBER_MINIGUN_BULLETS_PER_SEC:
+                minigun_last_bullet_ms = now_ms
+                play_sound("arrow")
+                spawn_robber_bullet(mx, my, ROBBER_MINIGUN_DAMAGE_MULT)
+        elif not minigun_overheat_until_ms or now_ms >= minigun_overheat_until_ms:
+            if clicked and not minigun_charge_start_ms:
+                minigun_charge_start_ms = now_ms
+            if minigun_charge_start_ms:
+                if not mouse_held:
+                    minigun_charge_start_ms = 0
+                elif now_ms - minigun_charge_start_ms >= ROBBER_MINIGUN_CHARGE_MS:
+                    minigun_charge_start_ms = 0
+                    minigun_firing_until_ms = now_ms + ROBBER_MINIGUN_FIRE_DURATION_MS
+                    minigun_last_bullet_ms = now_ms
+                    play_sound("arrow")
+                    spawn_robber_bullet(mx, my, ROBBER_MINIGUN_DAMAGE_MULT)
+        return
+    # --- Shotgun: 5 pellets per click ---
+    if gun == "shotgun":
+        if clicked:
+            play_sound("arrow")
+            for _ in range(ROBBER_SHOTGUN_PELLETS):
+                spawn_robber_bullet(mx, my, 1.0, spread_deg=8)
+        return
+    # --- Flamethrower: AOE cone + 5s burn (tick every 100ms while held) ---
+    if gun == "flamethrower":
+        if mouse_held and now_ms - last_robber_flame_tick_ms >= ROBBER_FLAME_TICK_MS:
+            last_robber_flame_tick_ms = now_ms
+            ang = math.atan2(my - player.centery, mx - player.centerx)
+            half = ROBBER_FLAME_CONE_ANGLE_RAD / 2
+            dmg = max(1, int(arrow_damage * ROBBER_FLAME_DMG_PER_TICK))
+            for enemy in enemies[:]:
+                ex = enemy.rect.centerx - player.centerx
+                ey = enemy.rect.centery - player.centery
+                dist = math.hypot(ex, ey)
+                if dist > ROBBER_FLAME_CONE_RANGE:
+                    continue
+                eang = math.atan2(ey, ex)
+                diff = abs((eang - ang + math.pi) % (2 * math.pi) - math.pi)
+                if diff <= half:
+                    enemy.hp -= dmg
+                    enemy.burn_ms_left = ROBBER_FLAME_BURN_MS
+                    enemy.last_status_tick = now_ms - 1000
+                    floating_texts.append({"x": enemy.rect.centerx, "y": enemy.rect.top - 12, "txt": f"-{dmg}", "color": ORANGE, "ttl": 800, "vy": -0.5, "alpha": 255})
+                    if enemy.hp <= 0:
+                        record_assassin_kill(enemy)
+                        score += 1
+                        spawn_orb(enemy.rect.centerx, enemy.rect.centery, amount=1)
+                        try: enemies.remove(enemy)
+                        except: pass
+        return
+    # --- Sniper: 1 shot every 3.14s, 6x damage ---
+    if gun == "sniper":
+        if (clicked or mouse_held) and now_ms - last_robber_sniper_ms >= ROBBER_SNIPER_INTERVAL_MS:
+            last_robber_sniper_ms = now_ms
+            play_sound("arrow")
+            spawn_robber_bullet(mx, my, ROBBER_SNIPER_DAMAGE_MULT)
+        return
+
 # ---------- Menus ----------
 # Short class descriptions for shop (fits in button width)
 CLASS_SHORT_DESC = {
@@ -2120,25 +2264,47 @@ CLASS_SHORT_DESC = {
     "Vampire": "Life steal + fly (V)",
     "Assassin": "Invis + backstab knife (V)",
     "Mad Scientist": "Homing + splash, V: Overcharge",
+    "Robber": "5 guns (1–5), replaces bow",
 }
 
 def class_shop_menu():
     global gems, player_class, owned_classes
+    show_robber = False  # becomes True when player clicks on Gems (if gems >= 15000)
+    # Build list of classes to show (Robber only if show_robber and gems >= ROBBER_MIN_GEMS_TO_SHOW)
+    def visible_classes():
+        out = []
+        for cls in PLAYER_CLASS_ORDER:
+            if cls.name == "Robber":
+                if show_robber and gems >= ROBBER_MIN_GEMS_TO_SHOW:
+                    out.append(cls)
+            else:
+                out.append(cls)
+        return out
     # Layout: fixed compact class boxes (don't grow on big screens)
-    n_classes = len(PLAYER_CLASS_ORDER)
     area_top = 160
     back_height = 72
-    row_h = min(70, max(52, (HEIGHT - area_top - back_height) // n_classes))
-    btn_h = row_h - 6
-    y_start = area_top
     max_w = min(520, WIDTH - 80)
+    gem_label_rect = None  # set each frame for click detection
     while True:
+        vis = visible_classes()
+        n_classes = len(vis)
+        row_h = min(70, max(52, (HEIGHT - area_top - back_height) // max(n_classes, 1)))
+        btn_h = row_h - 6
+        y_start = area_top
         screen.fill(bg_color)
         draw_text_centered(FONT_LG, "Class Shop", 60)
-        draw_text_centered(FONT_MD, f"Gems: {gems}", 120)
+        gem_txt = f"Gems: {gems}"
+        gem_surf = FONT_MD.render(gem_txt, True, BLACK)
+        gem_x = WIDTH//2 - gem_surf.get_width()//2
+        gem_y = 118
+        gem_label_rect = pygame.Rect(gem_x, gem_y - 4, gem_surf.get_width(), gem_surf.get_height() + 8)
+        screen.blit(gem_surf, (gem_x, gem_y))
+        if gems >= ROBBER_MIN_GEMS_TO_SHOW:
+            hint = FONT_XS.render("(click gems to reveal secret class)", True, DARK_GRAY)
+            screen.blit(hint, (WIDTH//2 - hint.get_width()//2, gem_y + 22))
 
         buttons = []
-        for i, cls in enumerate(PLAYER_CLASS_ORDER):
+        for i, cls in enumerate(vis):
             y = y_start + i * row_h
             rect = pygame.Rect(WIDTH//2 - max_w//2, y, max_w, btn_h)
             cost = CLASS_COSTS[cls.name]
@@ -2176,6 +2342,9 @@ def class_shop_menu():
                 save_game(); return
             if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 mx,my = ev.pos
+                if gem_label_rect and gem_label_rect.collidepoint(mx, my) and gems >= ROBBER_MIN_GEMS_TO_SHOW:
+                    show_robber = True
+                    play_sound("menu_click")
                 for r, cls, cost, selected, owned in buttons:
                     if r.collidepoint(mx,my):
                         play_sound("menu_click")
@@ -2202,115 +2371,184 @@ def class_shop_menu():
 ADMIN_CODE = (pygame.K_6, pygame.K_5, pygame.K_4, pygame.K_3)
 
 def admin_panel():
-    """In-game admin panel: type 6543 during play."""
+    """In-game admin panel: type 6543 during play. Scrollable, all abilities individual, extra cheats."""
     global gems, player_speed, owned_abilities, corrosive_level, arrow_damage, max_hp, player_hp
     global knockback_level, pierce_level, player_level, player_exp, exp_required, wave
     global in_collection_phase, collection_start_ms, collection_duration_ms, enemies
-    btn_w = 280
-    btn_h = 40
-    row = 44
-    left_x = WIDTH//2 - 320
-    right_x = WIDTH//2 + 40
-    y_start = 120
+    global admin_god_mode
+    btn_w = 200
+    btn_h = 36
+    row = 40
+    pad = 24
+    panel_center_x = WIDTH // 2
+    left_x = panel_center_x - 320
+    right_x = panel_center_x - 100
+    y_start = 130
+    # Fixed list of ability names (same order as owned_abilities keys for consistent toggles)
+    ability_names = [
+        "Flame", "Poison", "Lightning", "Frost", "Bounty", "Ricochet", "Scavenger", "Haste",
+        "Knockback", "Piercing", "Critical", "Splash", "Overdraw", "Thorns",
+        "Double Shot", "Triple Shot", "Explosive", "Volley", "Vampiric", "Chain Lightning",
+        "Heartseeker", "Berserk", "Shatter", "Corrosive", "Execution",
+        "Lucky", "Armor +10", "Tough"
+    ]
+    ab_cols = 4
+    ab_w = 148
+    ab_h = 32
 
-    ab_w = 100  # narrower for ability row
-    def mk_rects():
-        r, rects, labels = 0, [], []
-        def add(x, y, label, w=btn_w):
-            nonlocal r
+    def build_buttons():
+        """Returns list of (rect in content coords, action_key, label). action_key: str or ('ability', name) or ('wave', n)."""
+        rects, keys, labels = [], [], []
+        y = y_start
+        def add(x, w, label, key):
             rects.append(pygame.Rect(x, y, w, btn_h))
+            keys.append(key)
             labels.append(label)
-            r += 1
-        add(left_x, y_start + 0*row, "Full Heal")
-        add(left_x, y_start + 1*row, f"Speed: {player_speed}")
-        add(left_x, y_start + 2*row, "Give Corrosive (max)")
-        add(left_x, y_start + 3*row, "Give ALL abilities")
-        add(left_x, y_start + 4*row, "+5000 Gems")
-        add(left_x, y_start + 5*row, "+100 Arrow Dmg")
-        add(left_x, y_start + 6*row, "Set 500 Max HP + heal")
-        add(right_x, y_start + 0*row, "Set Level 20")
-        add(right_x, y_start + 1*row, "Skip to next wave")
-        add(right_x, y_start + 2*row, "+5 Knockback")
-        add(right_x, y_start + 3*row, "Max Piercing (3)")
-        add(right_x, y_start + 4*row, "Back")
-        # Specific abilities row
-        ability_y = y_start + 7*row
-        add(left_x, ability_y, "Flame", ab_w)
-        add(left_x + ab_w + 4, ability_y, "Poison", ab_w)
-        add(left_x + (ab_w+4)*2, ability_y, "Lightning", ab_w)
-        add(left_x + (ab_w+4)*3, ability_y, "Dbl Shot", ab_w)
-        add(left_x + (ab_w+4)*4, ability_y, "Execute", ab_w)
-        return rects, labels
+        # ---- Stats (left column) ----
+        add(left_x, btn_w, "Full Heal", "heal")
+        y += row
+        add(left_x, btn_w, f"Speed: {player_speed}", "speed")
+        y += row
+        add(left_x, btn_w, "+5000 Gems", "gems")
+        y += row
+        add(left_x, btn_w, "+100 Arrow Dmg", "dmg")
+        y += row
+        add(left_x, btn_w, "Set 500 Max HP + heal", "max_hp")
+        y += row
+        add(left_x, btn_w, "Set Level 20", "level20")
+        y += row
+        add(left_x, btn_w, "Skip to next wave", "skip_wave")
+        y += row
+        add(left_x, btn_w, "+5 Knockback", "knockback")
+        y += row
+        add(left_x, btn_w, "Max Piercing (3)", "pierce")
+        y += row + 8
+        # ---- Set Wave (small row) ----
+        for idx, n in enumerate((1, 5, 10, 25)):
+            rects.append(pygame.Rect(left_x + idx * 76, y, 72, btn_h))
+            keys.append(("wave", n))
+            labels.append(f"Wave {n}")
+        y += row
+        # ---- Cheats ----
+        add(left_x, btn_w, "God Mode: " + ("ON" if admin_god_mode else "OFF"), "god")
+        y += row
+        add(left_x, btn_w, "Clear all enemies", "clear_enemies")
+        y += row
+        add(left_x, btn_w, "Give ALL abilities + max", "all_abilities")
+        y += row
+        add(left_x, btn_w, "Corrosive (max only)", "corrosive_max")
+        y += row + 12
+        # ---- Abilities section header (non-clickable) ----
+        rects.append(pygame.Rect(left_x, y, 380, 22))
+        keys.append("noop")
+        labels.append("--- Abilities (click to toggle) ---")
+        y += 26
+        for i, name in enumerate(ability_names):
+            col = i % ab_cols
+            row_i = i // ab_cols
+            x = left_x + col * (ab_w + 6)
+            ay = y + row_i * (ab_h + 4)
+            rects.append(pygame.Rect(x, ay, ab_w, ab_h))
+            keys.append(("ability", name))
+            on = owned_abilities.get(name, False)
+            labels.append(name + (" ✓" if on else ""))
+        y += (len(ability_names) + ab_cols - 1) // ab_cols * (ab_h + 4) + 16
+        # ---- Back ----
+        add(panel_center_x - 90, 180, "Back", "back")
+        return rects, keys, labels
 
-    rects, labels = mk_rects()
+    content_height = 1400
+    scroll_y = 0
+    max_scroll = max(0, content_height - HEIGHT + 60)
     while True:
+        rects, keys, labels = build_buttons()
         overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 200))
         screen.blit(overlay, (0, 0))
         draw_text_centered(FONT_LG, "Admin Panel", 45, WHITE)
-        draw_text_centered(FONT_SM, f"HP: {player_hp}/{max_hp}  Dmg: {arrow_damage}  Gems: {gems}  Wave: {wave}", 88, LIGHT_GRAY)
+        draw_text_centered(FONT_SM, f"HP: {player_hp}/{max_hp}  Dmg: {arrow_damage}  Gems: {gems}  Wave: {wave}" + ("  [GOD]" if admin_god_mode else ""), 88, LIGHT_GRAY)
         mx, my = pygame.mouse.get_pos()
-        rects, labels = mk_rects()
+        content_my = my + scroll_y
         for i, (rect, label) in enumerate(zip(rects, labels)):
-            c = (220, 240, 220) if rect.collidepoint(mx, my) else (180, 200, 180)
-            pygame.draw.rect(screen, c, rect)
-            pygame.draw.rect(screen, (40, 80, 40), rect, 2)
-            w = FONT_MD.size(label)[0]
-            screen.blit(FONT_MD.render(label, True, BLACK), (rect.x + (rect.w - w)//2, rect.y + 8))
+            draw_y = rect.y - scroll_y
+            if draw_y + rect.h < 100 or draw_y > HEIGHT - 20:
+                continue
+            draw_rect = pygame.Rect(rect.x, draw_y, rect.w, rect.h)
+            hover = draw_rect.collidepoint(mx, my)
+            c = (220, 255, 220) if hover else (180, 210, 180)
+            pygame.draw.rect(screen, c, draw_rect)
+            pygame.draw.rect(screen, (40, 100, 40), draw_rect, 2)
+            font = FONT_XS if rect.w <= 72 else (FONT_SM if rect.w < 200 else FONT_MD)
+            w = font.size(label)[0]
+            screen.blit(font.render(label, True, BLACK), (draw_rect.x + (draw_rect.w - w) // 2, draw_rect.y + (draw_rect.h - font.get_height()) // 2))
+        # Scroll hint
+        if max_scroll > 0:
+            draw_text_centered(FONT_XS, "Scroll: mouse wheel", HEIGHT - 28, (150, 150, 150))
         pygame.display.flip()
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 return
             if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
                 return
+            if ev.type == pygame.MOUSEWHEEL:
+                scroll_y = max(0, min(max_scroll, scroll_y - ev.y * 50))
             if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                click_content_y = ev.pos[1] + scroll_y
                 for i, rect in enumerate(rects):
-                    if not rect.collidepoint(ev.pos):
+                    if not rect.collidepoint(ev.pos[0], click_content_y):
                         continue
-                    if i == 0:
+                    key = keys[i]
+                    if key == "heal":
                         player_hp = max_hp
-                    elif i == 1:
+                    elif key == "speed":
                         player_speed = 8 if player_speed == 5 else (12 if player_speed == 8 else 5)
-                    elif i == 2:
-                        owned_abilities["Corrosive"] = True
-                        corrosive_level = 5
-                    elif i == 3:
+                    elif key == "gems":
+                        gems += 5000
+                    elif key == "dmg":
+                        arrow_damage += 100
+                    elif key == "max_hp":
+                        max_hp = 500
+                        player_hp = 500
+                    elif key == "level20":
+                        player_level = 20
+                        player_exp = 0
+                        exp_required = 10 + 10 * (player_level - 1)
+                    elif key == "skip_wave":
+                        enemies.clear()
+                        in_collection_phase = True
+                        collection_start_ms = pygame.time.get_ticks() - collection_duration_ms - 100
+                    elif key == "knockback":
+                        knockback_level = min(5, knockback_level + 5)
+                    elif key == "pierce":
+                        pierce_level = 3
+                    elif isinstance(key, tuple) and key[0] == "wave":
+                        wave = key[1]
+                    elif key == "god":
+                        admin_god_mode = not admin_god_mode
+                    elif key == "clear_enemies":
+                        enemies.clear()
+                    elif key == "all_abilities":
                         for k in owned_abilities:
                             owned_abilities[k] = True
                         knockback_level = 5
                         pierce_level = 3
                         corrosive_level = 5
-                    elif i == 4:
-                        gems += 5000
-                    elif i == 5:
-                        arrow_damage += 100
-                    elif i == 6:
-                        max_hp = 500
-                        player_hp = 500
-                    elif i == 7:
-                        player_level = 20
-                        player_exp = 0
-                        exp_required = 10 + 10 * (player_level - 1)
-                    elif i == 8:
-                        enemies.clear()
-                        in_collection_phase = True
-                        collection_start_ms = pygame.time.get_ticks() - collection_duration_ms - 100
-                    elif i == 9:
-                        knockback_level = min(5, knockback_level + 5)
-                    elif i == 10:
-                        pierce_level = 3
-                    elif i == 11:
+                    elif key == "corrosive_max":
+                        owned_abilities["Corrosive"] = True
+                        corrosive_level = 5
+                    elif key == "back":
                         return
-                    elif i == 12:
-                        owned_abilities["Flame"] = True
-                    elif i == 13:
-                        owned_abilities["Poison"] = True
-                    elif i == 14:
-                        owned_abilities["Lightning"] = True
-                    elif i == 15:
-                        owned_abilities["Double Shot"] = True
-                    elif i == 16:
-                        owned_abilities["Execution"] = True
+                    elif key == "noop":
+                        pass
+                    elif isinstance(key, tuple) and key[0] == "ability":
+                        ab_name = key[1]
+                        owned_abilities[ab_name] = not owned_abilities.get(ab_name, False)
+                        if ab_name == "Knockback" and owned_abilities[ab_name]:
+                            knockback_level = min(5, knockback_level + 1)
+                        if ab_name == "Piercing" and owned_abilities[ab_name]:
+                            pierce_level = min(3, pierce_level + 1)
+                        if ab_name == "Corrosive" and owned_abilities[ab_name]:
+                            corrosive_level = min(5, max(1, corrosive_level + 1))
                     break
         clock.tick(FPS)
 
@@ -2524,6 +2762,7 @@ def game_loop():
     global assassin_invis_until_ms, assassin_invis_cooldown_until_ms
     global mad_scientist_overcharge_until_ms, mad_scientist_overcharge_cooldown_until_ms
     global assassin_active_bounties, assassin_bounty_refresh_at_ms
+    global robbers_gun
 
     gems_this_run = 0
     player.center = (WIDTH//2, HEIGHT//2)
@@ -2605,8 +2844,20 @@ def game_loop():
                         save_game()
                         return
                     continue
-                if ev.key == pygame.K_1: weapon = "bow"
-                if ev.key == pygame.K_2: weapon = "sword"
+                if ev.key == pygame.K_1:
+                    if isinstance(player_class, Robber):
+                        robbers_gun = "ak47"
+                    else:
+                        weapon = "bow"
+                if ev.key == pygame.K_2:
+                    if isinstance(player_class, Robber):
+                        robbers_gun = "minigun"
+                    else:
+                        weapon = "sword"
+                if isinstance(player_class, Robber):
+                    if ev.key == pygame.K_3: robbers_gun = "shotgun"
+                    if ev.key == pygame.K_4: robbers_gun = "flamethrower"
+                    if ev.key == pygame.K_5: robbers_gun = "sniper"
                 if ev.key == pygame.K_v and isinstance(player_class, Vampire):
                     if now_ms >= vampire_fly_cooldown_until_ms and now_ms >= vampire_fly_until_ms:
                         vampire_fly_until_ms = now_ms + Vampire.FLY_DURATION_MS
@@ -2672,7 +2923,9 @@ def game_loop():
                             break
                     continue
 
-                if weapon == "bow":
+                if isinstance(player_class, Robber):
+                    update_robber_guns(now_ms, mx, my, True, True)
+                elif weapon == "bow":
                     shoot_bow(mx,my)
                 else:
                     handle_sword_attack(mx,my)
@@ -2686,6 +2939,11 @@ def game_loop():
             if keys[pygame.K_a]: player.x -= speed
             if keys[pygame.K_d]: player.x += speed
         player.clamp_ip(screen.get_rect())
+
+        # Robber: hold-to-fire (AK, flamethrower) and minigun auto-fire
+        if isinstance(player_class, Robber):
+            mx, my = pygame.mouse.get_pos()
+            update_robber_guns(now_ms, mx, my, pygame.mouse.get_pressed()[0], False)
 
         vampire_fly = isinstance(player_class, Vampire) and now_ms < vampire_fly_until_ms
         assassin_invis = isinstance(player_class, Assassin) and now_ms < assassin_invis_until_ms
@@ -2807,10 +3065,11 @@ def game_loop():
                                 record_assassin_kill(enemy)
                                 spawn_orb(enemy.rect.centerx, enemy.rect.centery, amount=1)
                                 globals()["score"] += 1
-                        player_hp -= dmg
+                        if not admin_god_mode:
+                            player_hp -= dmg
                         try: enemies.remove(enemy)
                         except: pass
-                        if player_hp <= 0:
+                        if not admin_god_mode and player_hp <= 0:
                             play_sound("death")
                             game_over_screen(); reset_game(); return
 
@@ -2823,10 +3082,11 @@ def game_loop():
                 dmg = ea.damage
                 if isinstance(player_class, Knight):
                     dmg = int(math.ceil(dmg*0.90))
-                player_hp -= dmg
+                if not admin_god_mode:
+                    player_hp -= dmg
                 try: enemy_arrows.remove(ea)
                 except: pass
-                if player_hp <= 0:
+                if not admin_god_mode and player_hp <= 0:
                     play_sound("death")
                     game_over_screen(); reset_game(); return
             elif player.colliderect(ea.rect) and assassin_invis:
@@ -2837,8 +3097,10 @@ def game_loop():
         for a in arrows[:]:
             for enemy in enemies[:]:
                 if enemy.rect.colliderect(a.rect):
+                    dmg_override = getattr(a, "damage_override", None)
+                    hit_dmg = dmg_override if dmg_override is not None else arrow_damage
                     if online_mode and net is not None and hasattr(enemy, "_net_id"):
-                        net.send_hit(enemy._net_id, arrow_damage)
+                        net.send_hit(enemy._net_id, hit_dmg)
 
 
                         # online EXP + gems (client-side immediate)
@@ -2851,7 +3113,7 @@ def game_loop():
                             exp_required = 10 + 10 * (player_level - 1)
                             play_sound("levelup")
                     else:
-                        handle_arrow_hit(enemy)
+                        handle_arrow_hit(enemy, hit_dmg)
                     if getattr(a,"pierce_remaining",0) > 0:
                         a.pierce_remaining -= 1
                     else:
@@ -2957,7 +3219,15 @@ def game_loop():
                 screen.blit(tag, (r.x, r.y - 18))
 
         # weapon visuals (hidden when Assassin invisible)
-        if not assassin_invis and weapon == "bow":
+        if not assassin_invis and isinstance(player_class, Robber):
+            mx, my = pygame.mouse.get_pos()
+            ang = math.atan2(my - player.centery, mx - player.centerx)
+            gun_len = 50
+            tipx = int(player.centerx + gun_len * math.cos(ang))
+            tipy = int(player.centery + gun_len * math.sin(ang))
+            gun_colors = {"ak47": (60, 60, 60), "minigun": (80, 70, 60), "shotgun": (90, 50, 30), "flamethrower": (200, 100, 0), "sniper": (40, 50, 40)}
+            pygame.draw.line(screen, gun_colors.get(robbers_gun, (60, 60, 60)), (player.centerx, player.centery), (tipx, tipy), 5)
+        elif not assassin_invis and weapon == "bow":
             bow_len = 60
             arc_rect = pygame.Rect(player.centerx - 12, player.centery - bow_len, 24, bow_len*2)
             bow_color = BLUE if isinstance(player_class, MadScientist) else BROWN
@@ -3046,6 +3316,22 @@ def game_loop():
             else:
                 ability_txt = FONT_MD.render("V: Overcharge ready", True, GREEN)
             screen.blit(ability_txt, (12, 84))
+        if isinstance(player_class, Robber):
+            gun_names = {"ak47": "AK-47", "minigun": "Minigun", "shotgun": "Shotgun", "flamethrower": "Flamethrower", "sniper": "Sniper"}
+            g = robbers_gun
+            ability_txt = FONT_SM.render(f"1:AK-47  2:Minigun  3:Shotgun  4:Flame  5:Sniper  [{gun_names.get(g, g)}]", True, BLACK)
+            screen.blit(ability_txt, (12, 84))
+            if minigun_charge_start_ms and now_ms < minigun_charge_start_ms + ROBBER_MINIGUN_CHARGE_MS:
+                pct = min(100, int(100 * (now_ms - minigun_charge_start_ms) / ROBBER_MINIGUN_CHARGE_MS))
+                charge_txt = FONT_XS.render(f"Minigun charging {pct}%", True, ORANGE)
+                screen.blit(charge_txt, (12, 108))
+            elif minigun_firing_until_ms and now_ms < minigun_firing_until_ms:
+                charge_txt = FONT_XS.render("Minigun FIRING", True, RED)
+                screen.blit(charge_txt, (12, 108))
+            elif minigun_overheat_until_ms and now_ms < minigun_overheat_until_ms:
+                sec = (minigun_overheat_until_ms - now_ms) / 1000.0
+                charge_txt = FONT_XS.render(f"Minigun cooling {sec:.1f}s", True, DARK_GRAY)
+                screen.blit(charge_txt, (12, 108))
 
         # Hit List button (Assassin only)
         hitlist_btn = pygame.Rect(WIDTH - 230, HEIGHT - 60, 100, 40)
