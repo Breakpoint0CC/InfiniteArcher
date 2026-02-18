@@ -35,16 +35,15 @@ online_mode = False
 online_coop_enemies = True  # server-authoritative enemies
 net = None
 
-# Settings (volume, fullscreen, music); loaded on startup
+# Settings (volume, fullscreen); loaded on startup
 def load_settings():
-    out = {"volume": 0.7, "fullscreen": True, "music": True}
+    out = {"volume": 0.7, "fullscreen": True}
     try:
         if os.path.isfile(SETTINGS_FILE):
             with open(SETTINGS_FILE, "r") as f:
                 data = json.load(f)
             out["volume"] = max(0, min(1, float(data.get("volume", 0.7))))
             out["fullscreen"] = bool(data.get("fullscreen", True))
-            out["music"] = bool(data.get("music", True))
     except Exception:
         pass
     return out
@@ -71,6 +70,13 @@ def get_save_path(slot=None):
     s = current_save_slot if slot is None else int(slot)
     s = max(1, min(3, s))
     return SAVE_SLOTS[s - 1]
+
+def get_meta_path(slot=None):
+    """Separate file per slot for gems + owned classes (persists across New Game)."""
+    s = current_save_slot if slot is None else int(slot)
+    s = max(1, min(3, s))
+    base = os.path.splitext(SAVE_SLOTS[s - 1])[0]
+    return base + "_meta.json"
 
 # Display (from settings)
 apply_display_mode()
@@ -104,11 +110,10 @@ def _make_tone(freq, duration_sec=0.08, volume=0.2):
         w.writeframes(b"".join(frames))
     return buf.getvalue()
 
-def _make_music_loop():
-    """Gentle ambient pad loop: slow swell, low notes, no melody. ~6 sec."""
+def _make_arrow_sound():
+    """Short bow/arrow release: quick high-to-mid pitch, 0.05s."""
     sample_rate = 44100
-    duration_sec = 6.0
-    n_frames = int(sample_rate * duration_sec)
+    n_frames = int(sample_rate * 0.05)
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
         w.setnchannels(1)
@@ -117,58 +122,19 @@ def _make_music_loop():
         frames = []
         for i in range(n_frames):
             t = i / sample_rate
-            # Slow breathing envelope (one swell per ~3 sec)
-            env = 0.5 + 0.5 * math.sin(2 * math.pi * 0.32 * t)
-            # Two low pad notes, no attack - just sustained and soft
-            a = math.sin(2 * math.pi * 65 * t) * 0.5
-            b = math.sin(2 * math.pi * 98 * t) * 0.35
-            s = int(32767 * 0.045 * env * (a + b))
+            # Slight pitch drop (320 -> 200 Hz) over 0.05s for "thwip"
+            freq = 320 - (120 * t / 0.05)
+            s = int(32767 * 0.2 * math.sin(2 * math.pi * freq * t))
             frames.append(struct.pack("h", max(-32768, min(32767, s))))
         w.writeframes(b"".join(frames))
     return buf.getvalue()
-
-_music_loop_bytes = None
-if _mixer_ok:
-    try:
-        _music_loop_bytes = _make_music_loop()
-    except Exception:
-        pass
-
-def start_music():
-    if not _mixer_ok or not settings.get("music", False):
-        return
-    base = os.path.dirname(os.path.abspath(__file__))
-    for name in ("music.ogg", "music.wav"):
-        path = os.path.join(base, name)
-        if os.path.isfile(path):
-            try:
-                pygame.mixer.music.load(path)
-                pygame.mixer.music.set_volume(0.4 * settings.get("volume", 0.7))
-                pygame.mixer.music.play(-1)
-            except Exception:
-                pass
-            return
-    # No file: use gentle built-in pad loop
-    if _music_loop_bytes is not None:
-        try:
-            buf = io.BytesIO(_music_loop_bytes)
-            pygame.mixer.music.load(buf)
-            pygame.mixer.music.set_volume(0.35 * settings.get("volume", 0.7))
-            pygame.mixer.music.play(-1)
-        except Exception:
-            pass
-
-def stop_music():
-    try:
-        pygame.mixer.music.stop()
-    except Exception:
-        pass
 
 def _init_sounds():
     if not _mixer_ok:
         return
     try:
         _sounds["shoot"] = pygame.mixer.Sound(buffer=io.BytesIO(_make_tone(380, 0.06, 0.15)))
+        _sounds["arrow"] = pygame.mixer.Sound(buffer=io.BytesIO(_make_arrow_sound()))
         _sounds["hit"] = pygame.mixer.Sound(buffer=io.BytesIO(_make_tone(180, 0.05, 0.2)))
         _sounds["levelup"] = pygame.mixer.Sound(buffer=io.BytesIO(_make_tone(520, 0.12, 0.22)))
         _sounds["death"] = pygame.mixer.Sound(buffer=io.BytesIO(_make_tone(120, 0.35, 0.3)))
@@ -222,13 +188,36 @@ RARITY_COLORS = {
 ABILITY_RARITY = {
     "Heal +20 HP": "Common",
     "Damage +5": "Common",
+    "Lucky": "Common",
+    "Armor +10": "Common",
+    "Steady": "Common",
+    "Vitality": "Common",
+    "Tough": "Common",
     "Flame": "Rare",
     "Poison": "Rare",
     "Lightning": "Rare",
+    "Frost": "Rare",
+    "Bounty": "Rare",
+    "Ricochet": "Rare",
+    "Scavenger": "Rare",
+    "Haste": "Rare",
     "Knockback": "Epic",
     "Piercing": "Epic",
+    "Critical": "Epic",
+    "Splash": "Epic",
+    "Overdraw": "Epic",
+    "Thorns": "Epic",
     "Double Shot": "Legendary",
-    "Corrosive": "Mythical"
+    "Explosive": "Legendary",
+    "Volley": "Legendary",
+    "Vampiric": "Legendary",
+    "Chain Lightning": "Legendary",
+    "Heartseeker": "Legendary",
+    "Berserk": "Legendary",
+    "Shatter": "Legendary",
+    "Corrosive": "Mythical",
+    "Execution": "Mythical",
+    "Triple Shot": "Mythical",
 }
 
 DEFAULTS = {
@@ -236,7 +225,7 @@ DEFAULTS = {
     "player_speed": 5,
     "max_hp": 100,
     "arrow_speed": 18,
-    "arrow_damage": 20,
+    "arrow_damage": 10,
     "sword_damage": 40,
     "sword_range": 120,
     "sword_arc_half_deg": 45,
@@ -259,6 +248,28 @@ def generate_spawn_pattern(n):
 def draw_text_centered(font, text, y, color=BLACK):
     surf = font.render(text, True, color)
     screen.blit(surf, (WIDTH//2 - surf.get_width()//2, y))
+
+def wrap_text_to_width(font, text, max_pixel_width):
+    """Return list of lines that fit within max_pixel_width."""
+    if not text:
+        return []
+    words = text.split()
+    lines = []
+    current = []
+    for w in words:
+        trial = " ".join(current + [w]) if current else w
+        if font.render(trial, True, BLACK).get_width() <= max_pixel_width:
+            current.append(w)
+        else:
+            if current:
+                lines.append(" ".join(current))
+            current = [w] if font.render(w, True, BLACK).get_width() <= max_pixel_width else []
+            if current == []:
+                lines.append(w)
+                current = []
+    if current:
+        lines.append(" ".join(current))
+    return lines
 
 # ---------- ONLINE (CLIENT) ----------
 # Fixes:
@@ -601,8 +612,10 @@ class Enemy:
             self.speed = base_speed
             self.damage = base_damage
 
+        self.max_hp = self.hp
         self.burn_ms_left = 0
         self.poison_ms_left = 0
+        self.slow_until_ms = 0
         self.last_status_tick = 0
         self.shoot_timer = 0
         self.shoot_interval = 1800 + random.randint(-400,400)
@@ -613,6 +626,8 @@ class Enemy:
         dist = math.hypot(dx, dy)
         if dist==0: return
         spd = self.speed*(0.5 if self.poison_ms_left>0 else 1.0)
+        if getattr(self, "slow_until_ms", 0) and pygame.time.get_ticks() < self.slow_until_ms:
+            spd *= 0.4
         self.rect.x += round(spd*dx/dist)
         self.rect.y += round(spd*dy/dist)
 
@@ -791,12 +806,43 @@ class MadScientist(PlayerClass):
     name = "Mad Scientist"
     color = (120,255,120)
     rarity_tier = "Advanced"
+    SPLASH_RANGE = 100
+    SPLASH_RATIO = 0.35  # 35% damage to one nearby enemy
+    OVERCHARGE_DURATION_MS = 4500   # V: fire 3 homing arrows per shot
+    OVERCHARGE_COOLDOWN_MS = 28000
+
     def on_arrow_fire(self, mx, my):
         if not enemies:
             return False
-        closest = min(enemies, key=lambda e: math.hypot(e.rect.centerx - player.centerx, e.rect.centery - player.centery))
-        arrows.append(Arrow(player.centerx, player.centery, mx, my, pierce=pierce_level, target=closest, turn_rate=0.24, color=BLUE))
+        now_ms = pygame.time.get_ticks()
+        overcharge = now_ms < globals().get("mad_scientist_overcharge_until_ms", 0)
+        sorted_enemies = sorted(enemies, key=lambda e: math.hypot(e.rect.centerx - player.centerx, e.rect.centery - player.centery))
+        if overcharge:
+            targets = (sorted_enemies * 2)[:3]  # 3 arrows, repeat closest if fewer enemies
+        else:
+            targets = sorted_enemies[:1]
+        for t in targets:
+            arrows.append(Arrow(player.centerx, player.centery, t.rect.centerx, t.rect.centery, pierce=pierce_level, target=t, turn_rate=0.24, color=BLUE))
         return True
+
+    def on_arrow_hit(self, enemy, damage):
+        # Lab splash: deal bonus damage to closest other enemy in range
+        ox, oy = enemy.rect.centerx, enemy.rect.centery
+        others = [e for e in enemies if e is not enemy and getattr(e, "hp", 0) > 0]
+        if not others:
+            return
+        closest = min(others, key=lambda e: math.hypot(e.rect.centerx - ox, e.rect.centery - oy))
+        d = math.hypot(closest.rect.centerx - ox, closest.rect.centery - oy)
+        if d <= self.SPLASH_RANGE:
+            dmg2 = max(1, int(damage * self.SPLASH_RATIO))
+            closest.hp -= dmg2
+            floating_texts.append({"x": closest.rect.centerx, "y": closest.rect.top - 12, "txt": f"-{dmg2}", "color": (120, 255, 120), "ttl": 1000, "vy": -0.6, "alpha": 255})
+            if closest.hp <= 0:
+                record_assassin_kill(closest)
+                spawn_orb(closest.rect.centerx, closest.rect.centery, amount=1)
+                globals()["score"] += 1
+                try: enemies.remove(closest)
+                except: pass
 
 class Knight(PlayerClass):
     name = "Knight"
@@ -900,6 +946,11 @@ enemy_arrows = []
 enemies = []
 pending_orbs = []
 remote_arrows = []  # <-- friends arrows
+
+# Overdraw (Epic): first arrow hit each wave gets +50% damage
+first_arrow_hit_this_wave = False
+# Berserk (Legendary): on kill, next shot within 2.5s does +35% damage (one stack)
+berserk_until_ms = 0
 
 # Assassin hit list: 3 active bounties, refresh on timer (persists in save)
 assassin_active_bounties = []
@@ -1006,18 +1057,24 @@ def draw_fx(surface):
         pygame.draw.line(line_surf, (*YELLOW, alpha), (x1 - min_x, y1 - min_y), (x2 - min_x, y2 - min_y), 2)
         surface.blit(line_surf, (min_x, min_y))
 
-    # floating text (damage numbers, etc.)
+    # floating text (damage numbers, etc.) — with outline for readability
     for ft in floating_texts:
         txt = str(ft.get("txt", ""))
         if not txt:
             continue
         color = ft.get("color", BLACK)
         alpha = int(ft.get("alpha", 255))
-        surf = FONT_SM.render(txt, True, color)
+        x, y = int(ft.get("x", 0)), int(ft.get("y", 0))
+        surf_main = FONT_SM.render(txt, True, color)
+        surf_outline = FONT_SM.render(txt, True, BLACK)
         if alpha < 255:
-            surf = surf.convert_alpha()
-            surf.set_alpha(alpha)
-        surface.blit(surf, (int(ft.get("x", 0)), int(ft.get("y", 0))))
+            surf_main = surf_main.convert_alpha()
+            surf_main.set_alpha(alpha)
+            surf_outline = surf_outline.convert_alpha()
+            surf_outline.set_alpha(alpha)
+        for dx, dy in ((-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)):
+            surface.blit(surf_outline, (x + dx, y + dy))
+        surface.blit(surf_main, (x, y))
 
 def draw_chat(surface):
     # show last few messages
@@ -1053,34 +1110,101 @@ admin_unlocked = False
 admin_available_next_game = False
 bg_color = WHITE
 
-# save-slot meta shown in menus
+# save-slot meta shown in menus (from meta file; persists across New Game)
 slot_meta_cache = {1: {"gems":0,"player_class":"No Class"},
                    2: {"gems":0,"player_class":"No Class"},
                    3: {"gems":0,"player_class":"No Class"}}
 
 def load_slot_meta(slot):
-    path = get_save_path(slot)
+    """Read meta for menu display (gems, player_class) from slot's meta file."""
+    path = get_meta_path(slot)
+    slot = int(slot)
     if not os.path.exists(path):
-        slot_meta_cache[int(slot)] = {"gems":0,"player_class":"No Class"}
-        return slot_meta_cache[int(slot)]
+        # Fallback: read from run save file if no meta file yet
+        run_path = get_save_path(slot)
+        if os.path.exists(run_path):
+            try:
+                with open(run_path, "r") as f:
+                    data = json.load(f)
+                meta = {"gems": int(data.get("gems", 0)), "player_class": str(data.get("player_class", "No Class"))}
+                slot_meta_cache[slot] = meta
+                return meta
+            except Exception:
+                pass
+        slot_meta_cache[slot] = {"gems": 0, "player_class": "No Class"}
+        return slot_meta_cache[slot]
     try:
-        with open(path,"r") as f:
+        with open(path, "r") as f:
             data = json.load(f)
-        meta = {"gems": int(data.get("gems",0)),
-                "player_class": str(data.get("player_class","No Class"))}
-        slot_meta_cache[int(slot)] = meta
+        meta = {"gems": int(data.get("gems", 0)), "player_class": str(data.get("player_class", "No Class"))}
+        slot_meta_cache[slot] = meta
         return meta
     except Exception:
-        slot_meta_cache[int(slot)] = {"gems":0,"player_class":"No Class"}
-        return slot_meta_cache[int(slot)]
+        slot_meta_cache[slot] = {"gems": 0, "player_class": "No Class"}
+        return slot_meta_cache[slot]
 
 def refresh_all_slot_meta():
-    for s in (1,2,3):
+    for s in (1, 2, 3):
         load_slot_meta(s)
+
+def load_meta_into_game():
+    """Load gems, owned_classes, player_class from current slot's meta file (for New Game)."""
+    global gems, owned_classes, player_class
+    path = get_meta_path()
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        gems = int(data.get("gems", 0))
+        raw = data.get("owned_classes", [])
+        owned_classes.clear()
+        if isinstance(raw, list):
+            for c in raw:
+                if isinstance(c, str) and c.strip():
+                    owned_classes.add(c.strip())
+        if not owned_classes:
+            owned_classes.add("No Class")
+        class_name = str(data.get("player_class", "No Class"))
+        if class_name not in owned_classes:
+            owned_classes.add(class_name)
+        for cls in PLAYER_CLASS_ORDER:
+            if cls.name == class_name:
+                player_class = cls()
+                return
+        player_class = NoClass()
+    except Exception:
+        pass
+
+def save_meta():
+    """Write current slot's meta file (gems, owned_classes, player_class) so New Game keeps them."""
+    try:
+        # Merge with existing meta so we never lose a purchased class (e.g. when saving an older run)
+        existing_classes = set()
+        if os.path.exists(get_meta_path()):
+            try:
+                with open(get_meta_path(), "r") as f:
+                    existing = json.load(f)
+                for c in existing.get("owned_classes", []):
+                    if isinstance(c, str) and c.strip():
+                        existing_classes.add(c.strip())
+            except Exception:
+                pass
+        merged = existing_classes | (owned_classes if owned_classes else {player_class.name})
+        classes_to_save = list(merged)
+        data = {"gems": gems, "owned_classes": classes_to_save, "player_class": player_class.name}
+        with open(get_meta_path(), "w") as f:
+            json.dump(data, f)
+        load_slot_meta(current_save_slot)
+    except Exception as e:
+        print("Meta save failed:", e)
 
 # ---------- Save / Load ----------
 def save_game():
+    global owned_classes
     try:
+        # Never save empty owned_classes — persist at least current class
+        classes_to_save = list(owned_classes) if owned_classes else [player_class.name]
         data = {
             "player": [player.x, player.y, player.width, player.height],
             "player_hp": player_hp,
@@ -1094,6 +1218,7 @@ def save_game():
             "pierce_level": pierce_level,
             "knockback_level": knockback_level,
             "owned_abilities": owned_abilities,
+            "owned_classes": classes_to_save,
             "corrosive_level": corrosive_level,
             "enemies_per_wave": enemies_per_wave,
             "player_class": player_class.name,
@@ -1104,13 +1229,13 @@ def save_game():
         }
         with open(get_save_path(),"w") as f:
             json.dump(data,f)
-        load_slot_meta(current_save_slot)
+        save_meta()
     except Exception as e:
         print("Save failed:", e)
 
 def load_game():
     global player_hp, arrow_damage, player_exp, player_level, exp_required
-    global wave, score, gems, pierce_level, knockback_level, owned_abilities, corrosive_level
+    global wave, score, gems, pierce_level, knockback_level, owned_abilities, owned_classes, corrosive_level
     global enemies_per_wave, player_class
     global vampire_fly_until_ms, vampire_fly_cooldown_until_ms
     global assassin_invis_until_ms, assassin_invis_cooldown_until_ms
@@ -1142,6 +1267,16 @@ def load_game():
         enemies_per_wave = int(data.get("enemies_per_wave", DEFAULTS["enemies_per_wave_start"]))
 
         class_name = data.get("player_class","No Class")
+        owned_classes.clear()
+        raw = data.get("owned_classes", [class_name])
+        if isinstance(raw, list):
+            for c in raw:
+                if isinstance(c, str) and c.strip():
+                    owned_classes.add(c.strip())
+        if not owned_classes:
+            owned_classes.add("No Class")
+        if class_name not in owned_classes:
+            owned_classes.add(class_name)
         found = False
         for cls in PLAYER_CLASS_ORDER:
             if cls.name == class_name:
@@ -1159,6 +1294,8 @@ def load_game():
         vampire_fly_cooldown_until_ms = 0
         assassin_invis_until_ms = 0
         assassin_invis_cooldown_until_ms = 0
+        globals()["mad_scientist_overcharge_until_ms"] = 0
+        globals()["mad_scientist_overcharge_cooldown_until_ms"] = 0
         assassin_kills = dict(data.get("assassin_kills", {"normal": 0, "fast": 0, "tank": 0, "archer": 0, "boss": 0}))
         assassin_completed_bounties = set(data.get("assassin_completed_bounties", []))
         assassin_active_bounties = list(data.get("assassin_active_bounties", []))
@@ -1220,6 +1357,7 @@ def pause_menu():
         overlay.fill((0, 0, 0, 140))
         screen.blit(overlay, (0, 0))
         draw_text_centered(FONT_LG, "Paused", HEIGHT//2 - 180, WHITE)
+        draw_text_centered(FONT_MD, f"Wave {wave}  •  Score {score}", HEIGHT//2 - 125, (200, 200, 200))
         mx, my = pygame.mouse.get_pos()
         for rect, label in [(resume_rect, "Resume"), (save_rect, "Save"), (quit_rect, "Quit to Menu")]:
             color = LIGHT_GRAY if rect.collidepoint(mx, my) else (200, 200, 200)
@@ -1239,7 +1377,7 @@ def pause_menu():
                 if save_rect.collidepoint(ev.pos):
                     play_sound("menu_click")
                     save_game()
-                    floating_texts.append({"x": center_x, "y": HEIGHT//2 + 120, "txt": "Saved!", "color": BLUE, "ttl": 60, "vy": -0.5, "alpha": 255})
+                    floating_texts.append({"x": center_x, "y": HEIGHT//2 + 120, "txt": "Saved!", "color": BLUE, "ttl": 100, "vy": -0.5, "alpha": 255})
                 if quit_rect.collidepoint(ev.pos):
                     play_sound("menu_click")
                     return "quit"
@@ -1254,7 +1392,8 @@ def pause_menu():
 def reset_game():
     global player, player_hp, player_speed, max_hp
     global arrow_damage, sword_damage, sword_arc_half
-    global knockback_level, pierce_level, pierce_max_level, owned_abilities
+    global knockback_level, pierce_level, pierce_max_level, owned_abilities, first_arrow_hit_this_wave
+    global berserk_until_ms
     global wave, enemies_per_wave, score
     global weapon, gems
     global player_level, player_exp, exp_required
@@ -1262,10 +1401,12 @@ def reset_game():
     global spawn_pattern_positions, spawn_preview_ms, spawn_preview_active, spawn_preview_start_ms
     global corrosive_level
     global player_class
+    global owned_classes
     global net, online_mode
     global vampire_fly_until_ms, vampire_fly_cooldown_until_ms
     global assassin_invis_until_ms, assassin_invis_cooldown_until_ms
     global assassin_kills, assassin_completed_bounties, assassin_active_bounties, assassin_bounty_refresh_at_ms
+    global mad_scientist_overcharge_until_ms, mad_scientist_overcharge_cooldown_until_ms
 
     size = DEFAULTS["player_size"]
     player = pygame.Rect(WIDTH//2 - size//2, HEIGHT//2 - size//2, size, size)
@@ -1282,8 +1423,15 @@ def reset_game():
     pierce_max_level = 3
 
     owned_abilities = {
-        "Flame": False, "Poison": False, "Lightning": False,
-        "Knockback": False, "Piercing": False, "Double Shot": False, "Corrosive": False
+        "Flame": False, "Poison": False, "Lightning": False, "Frost": False, "Bounty": False,
+        "Ricochet": False, "Scavenger": False, "Haste": False,
+        "Knockback": False, "Piercing": False, "Critical": False, "Splash": False,
+        "Overdraw": False, "Thorns": False,
+        "Double Shot": False, "Triple Shot": False, "Explosive": False,
+        "Volley": False, "Vampiric": False, "Chain Lightning": False,
+        "Heartseeker": False, "Berserk": False, "Shatter": False,
+        "Corrosive": False, "Execution": False,
+        "Lucky": False, "Armor +10": False, "Tough": False
     }
 
     enemies.clear(); arrows.clear(); enemy_arrows.clear(); pending_orbs.clear()
@@ -1300,8 +1448,9 @@ def reset_game():
     player_exp = 0
     exp_required = 10 + 10*(player_level-1)
 
-    meta = load_slot_meta(current_save_slot)
-    gems = int(meta.get("gems",0))
+    gems = 0
+    first_arrow_hit_this_wave = False
+    berserk_until_ms = 0
 
     in_collection_phase = False
     collection_start_ms = None
@@ -1314,11 +1463,17 @@ def reset_game():
 
     corrosive_level = 0
     player_class = NoClass()
+    owned_classes = {"No Class"}
+
+    # Load persistent meta (gems, owned classes, equipped class) so New Game keeps them
+    load_meta_into_game()
 
     vampire_fly_until_ms = 0
     vampire_fly_cooldown_until_ms = 0
     assassin_invis_until_ms = 0
     assassin_invis_cooldown_until_ms = 0
+    mad_scientist_overcharge_until_ms = 0
+    mad_scientist_overcharge_cooldown_until_ms = 0
     assassin_kills = {"normal": 0, "fast": 0, "tank": 0, "archer": 0, "boss": 0}
     assassin_completed_bounties = set()
     assassin_active_bounties = []
@@ -1424,11 +1579,11 @@ def notify_once(msg, duration=900):
 
 # ---------- Ability choice between waves (repeat allowed) ----------
 def ability_choice_between_waves():
-    global player_hp, arrow_damage, knockback_level, pierce_level, corrosive_level
+    global player_hp, arrow_damage, knockback_level, pierce_level, corrosive_level, max_hp
 
     all_options = list(ABILITY_RARITY.keys())
-    # Don't offer Flame, Poison, Lightning, Double Shot again if already owned
-    one_shot_abilities = ("Flame", "Poison", "Lightning", "Double Shot")
+    # Don't offer these again if already owned
+    one_shot_abilities = ("Flame", "Poison", "Lightning", "Frost", "Bounty", "Ricochet", "Scavenger", "Haste", "Double Shot", "Triple Shot", "Corrosive", "Execution", "Critical", "Splash", "Lucky", "Armor +10", "Tough", "Overdraw", "Thorns", "Explosive", "Volley", "Vampiric", "Chain Lightning", "Heartseeker", "Berserk", "Shatter")
     def already_owned_no_repeat(ability):
         if ability in one_shot_abilities and owned_abilities.get(ability, False):
             return True
@@ -1437,7 +1592,7 @@ def ability_choice_between_waves():
     if not available_options:
         available_options = all_options[:]
 
-    rarity_weights = [("Common",50),("Rare",30),("Epic",15),("Legendary",4),("Mythical",1)]
+    rarity_weights = [("Common",45),("Rare",28),("Epic",14),("Legendary",10),("Mythical",3)]
     tiers, weights = zip(*rarity_weights)
     chosen_rarity = random.choices(tiers, weights=weights, k=1)[0]
 
@@ -1453,26 +1608,141 @@ def ability_choice_between_waves():
             return f"Piercing (Lv {pierce_level}/3)"
         if ability_label == "Corrosive":
             return f"Corrosive (Lv {corrosive_level}/5)"
+        if ability_label == "Execution":
+            return "Execution (execute ≤45% HP)"
+        if ability_label == "Critical":
+            return "Critical (20% 2x dmg)"
+        if ability_label == "Splash":
+            return "Splash (30% dmg in 50px)"
+        if ability_label == "Lucky":
+            return "Lucky (10% 1.5x dmg)"
+        if ability_label == "Bounty":
+            return "Bounty (25% +1 gem on collect)"
+        if ability_label == "Ricochet":
+            return "Ricochet (35% hit 1 more, 35% dmg)"
+        if ability_label == "Scavenger":
+            return "Scavenger (20% +5 exp on collect)"
+        if ability_label == "Overdraw":
+            return "Overdraw (1st hit each wave +50%)"
+        if ability_label == "Thorns":
+            return "Thorns (8 dmg to melee attackers)"
+        if ability_label == "Explosive":
+            return "Explosive (25% dmg in 65px)"
+        if ability_label == "Tough":
+            return "Tough (+15 max HP)"
+        if ability_label == "Haste":
+            return "Haste (12% slow 1s on hit)"
+        if ability_label == "Volley":
+            return "Volley (4 arrows)"
+        if ability_label == "Vampiric":
+            return "Vampiric (8% lifesteal)"
+        if ability_label == "Chain Lightning":
+            return "Chain Lightning (3 chains, 45%)"
+        if ability_label == "Heartseeker":
+            return "Heartseeker (+15% vs high HP)"
+        if ability_label == "Berserk":
+            return "Berserk (kill: next +35%)"
+        if ability_label == "Shatter":
+            return "Shatter (35% dmg in 40px)"
         return ability_label
 
+    def ability_description(ability_label):
+        descs = {
+            "Heal +20 HP": "Restore 20 HP.",
+            "Damage +5": "Arrows deal +5 damage.",
+            "Steady": "Arrows deal +3 damage.",
+            "Vitality": "Restore 15 HP.",
+            "Tough": "Permanently gain 15 max HP.",
+            "Lucky": "10% chance arrows deal 1.5x damage.",
+            "Armor +10": "Permanently gain 10 max HP.",
+            "Flame": "Arrows set enemies on fire (DoT).",
+            "Poison": "Arrows poison enemies (DoT, slow).",
+            "Lightning": "Chain to 2 nearby enemies (50% dmg).",
+            "Frost": "Arrows slow enemies for 2s.",
+            "Bounty": "25% chance +1 gem when collecting orbs.",
+            "Ricochet": "35% chance to hit 1 extra enemy (35% dmg).",
+            "Scavenger": "20% chance +5 exp when collecting orbs.",
+            "Haste": "12% chance to slow enemy 1s on hit.",
+            "Knockback": "Melee pushes enemies back (level 1–5).",
+            "Piercing": "Arrows pierce through enemies (level 1–3).",
+            "Critical": "20% chance arrows deal 2x damage.",
+            "Splash": "30% damage to enemies within 50px.",
+            "Overdraw": "First arrow hit each wave deals +50%.",
+            "Thorns": "Melee attackers take 8 damage.",
+            "Double Shot": "Fire 2 arrows per shot.",
+            "Explosive": "25% damage to enemies within 65px.",
+            "Volley": "Fire 4 arrows in a spread.",
+            "Vampiric": "Heal 8% of arrow damage dealt.",
+            "Chain Lightning": "Chain to 3 enemies (45% dmg).",
+            "Heartseeker": "+15% damage vs enemies above 70% HP.",
+            "Berserk": "On kill, next shot within 2.5s deals +35%.",
+            "Shatter": "35% damage to enemies within 40px.",
+            "Corrosive": "Acid field around you (level 1–5).",
+            "Execution": "Execute enemies at or below 45% HP.",
+            "Triple Shot": "Fire 3 arrows per shot.",
+        }
+        return descs.get(ability_label, "")
+
+    box_width = 260
+    padding_x = 12
+    padding_top = 12
+    gap = 10
+    padding_bottom = 14
+    max_text_width = box_width - padding_x * 2
+
+    def get_button_height(label):
+        display = ability_display_name(label)
+        desc = ability_description(label)
+        desc_short = (desc[:56] + ("…" if len(desc) > 56 else "")) if desc else ""
+        title_font = FONT_MD if FONT_MD.render(display, True, BLACK).get_width() <= max_text_width else FONT_SM
+        title_lines = wrap_text_to_width(title_font, display, max_text_width)
+        if not title_lines:
+            title_lines = [display]
+        line_height = title_font.render("Ay", True, BLACK).get_height()
+        title_height = len(title_lines) * line_height
+        desc_lines = wrap_text_to_width(FONT_SM, desc_short, max_text_width) if desc_short else []
+        desc_line_h = FONT_SM.render("Ay", True, BLACK).get_height()
+        desc_height = len(desc_lines) * desc_line_h if desc_lines else 0
+        return padding_top + title_height + (gap + desc_height if desc_height else 0) + padding_bottom
+
+    need_h = max(get_button_height(c) for c in choices)
+    need_h = max(need_h, 72)
+
     buttons = []
-    for i,c in enumerate(choices):
-        rect = pygame.Rect(WIDTH//2 - 220 + i*280, HEIGHT//2 - 50, 260, 80)
-        buttons.append((rect,c))
+    for i, c in enumerate(choices):
+        rect = pygame.Rect(WIDTH//2 - 220 + i*280, HEIGHT//2 - need_h//2, box_width, need_h)
+        buttons.append((rect, c))
 
     while True:
         screen.fill(bg_color)
         draw_text_centered(FONT_LG, f"Choose an Upgrade ({chosen_rarity})", HEIGHT//2 - 160, RARITY_COLORS.get(chosen_rarity, BLUE))
-        mx,my = pygame.mouse.get_pos()
-        for rect,label in buttons:
+        mx, my = pygame.mouse.get_pos()
+        for rect, label in buttons:
             display = ability_display_name(label)
-            rarity = ABILITY_RARITY.get(label,"Common")
+            desc = ability_description(label)
+            desc_short = (desc[:56] + ("…" if len(desc) > 56 else "")) if desc else ""
+            rarity = ABILITY_RARITY.get(label, "Common")
             pygame.draw.rect(screen, LIGHT_GRAY, rect)
             pygame.draw.rect(screen, RARITY_COLORS.get(rarity, BLACK), rect, 4)
-            txt = FONT_MD.render(display, True, BLACK)
-            if txt.get_width() > rect.w - 24:
-                txt = FONT_SM.render(display, True, BLACK)
-            screen.blit(txt, (rect.x+12, rect.y+18))
+
+            title_font = FONT_MD if FONT_MD.render(display, True, BLACK).get_width() <= max_text_width else FONT_SM
+            title_lines = wrap_text_to_width(title_font, display, max_text_width)
+            if not title_lines:
+                title_lines = [display]
+            line_height = title_font.render("Ay", True, BLACK).get_height()
+            y = rect.y + padding_top
+            for line in title_lines:
+                txt = title_font.render(line, True, BLACK)
+                screen.blit(txt, (rect.x + padding_x, y))
+                y += line_height
+            y += gap
+            if desc_short:
+                desc_lines = wrap_text_to_width(FONT_SM, desc_short, max_text_width)
+                desc_line_h = FONT_SM.render("Ay", True, BLACK).get_height()
+                for line in desc_lines:
+                    desc_txt = FONT_SM.render(line, True, DARK_GRAY)
+                    screen.blit(desc_txt, (rect.x + padding_x, y))
+                    y += desc_line_h
         pygame.display.flip()
 
         for ev in pygame.event.get():
@@ -1487,23 +1757,73 @@ def ability_choice_between_waves():
                             player_hp = min(max_hp, player_hp + 20)
                         elif label == "Damage +5":
                             arrow_damage += 5
+                        elif label == "Steady":
+                            arrow_damage += 3
+                        elif label == "Vitality":
+                            player_hp = min(max_hp, player_hp + 15)
+                        elif label == "Tough":
+                            max_hp += 15
+                            player_hp = min(max_hp, player_hp + 15)
+                            owned_abilities["Tough"] = True
+                        elif label == "Lucky":
+                            owned_abilities["Lucky"] = True
+                        elif label == "Armor +10":
+                            max_hp += 10
+                            player_hp = min(max_hp, player_hp + 10)
+                            owned_abilities["Armor +10"] = True
                         elif label == "Flame":
                             owned_abilities["Flame"] = True
                         elif label == "Poison":
                             owned_abilities["Poison"] = True
                         elif label == "Lightning":
                             owned_abilities["Lightning"] = True
+                        elif label == "Frost":
+                            owned_abilities["Frost"] = True
+                        elif label == "Bounty":
+                            owned_abilities["Bounty"] = True
+                        elif label == "Ricochet":
+                            owned_abilities["Ricochet"] = True
+                        elif label == "Scavenger":
+                            owned_abilities["Scavenger"] = True
+                        elif label == "Haste":
+                            owned_abilities["Haste"] = True
                         elif label == "Knockback":
                             knockback_level = min(5, knockback_level + 1)
                             owned_abilities["Knockback"] = True
                         elif label == "Piercing":
                             pierce_level = min(pierce_max_level, pierce_level + 1)
                             owned_abilities["Piercing"] = True
+                        elif label == "Critical":
+                            owned_abilities["Critical"] = True
+                        elif label == "Splash":
+                            owned_abilities["Splash"] = True
+                        elif label == "Overdraw":
+                            owned_abilities["Overdraw"] = True
+                        elif label == "Thorns":
+                            owned_abilities["Thorns"] = True
                         elif label == "Double Shot":
                             owned_abilities["Double Shot"] = True
+                        elif label == "Triple Shot":
+                            owned_abilities["Triple Shot"] = True
+                        elif label == "Explosive":
+                            owned_abilities["Explosive"] = True
+                        elif label == "Volley":
+                            owned_abilities["Volley"] = True
+                        elif label == "Vampiric":
+                            owned_abilities["Vampiric"] = True
+                        elif label == "Chain Lightning":
+                            owned_abilities["Chain Lightning"] = True
+                        elif label == "Heartseeker":
+                            owned_abilities["Heartseeker"] = True
+                        elif label == "Berserk":
+                            owned_abilities["Berserk"] = True
+                        elif label == "Shatter":
+                            owned_abilities["Shatter"] = True
                         elif label == "Corrosive":
                             owned_abilities["Corrosive"] = True
                             corrosive_level = min(5, max(1, corrosive_level + 1))
+                        elif label == "Execution":
+                            owned_abilities["Execution"] = True
                         return
 
 # ---------- Combat ----------
@@ -1523,21 +1843,184 @@ def draw_corrosive_field_visual(actual_radius, alpha=80, outline=True):
         pygame.draw.rect(screen, ACID_YELLOW, (left, top, size, size), 2)
 
 def handle_arrow_hit(enemy, dmg=None):
+    global first_arrow_hit_this_wave, berserk_until_ms, player_hp
     dmg = dmg if dmg is not None else arrow_damage
-    enemy.hp -= dmg
+    now = pygame.time.get_ticks()
+    # Berserk (Legendary): consume stack for +35% damage on next shot
+    if owned_abilities.get("Berserk", False) and berserk_until_ms and now < berserk_until_ms:
+        dmg = int(dmg * 1.35)
+        berserk_until_ms = 0
+    # Overdraw (Epic): first arrow hit each wave +50% damage
+    if owned_abilities.get("Overdraw", False) and not first_arrow_hit_this_wave:
+        dmg = int(dmg * 1.5)
+        first_arrow_hit_this_wave = True
+    # Heartseeker (Legendary): +15% damage to enemies above 70% HP
+    enemy_max = getattr(enemy, "max_hp", enemy.hp)
+    if owned_abilities.get("Heartseeker", False) and enemy_max > 0 and enemy.hp / enemy_max > 0.70:
+        dmg = int(dmg * 1.15)
+    # Lucky (Common): 10% chance for 1.5x damage
+    if owned_abilities.get("Lucky", False) and random.random() < 0.10:
+        dmg = int(dmg * 1.5)
+    # Critical (Epic): 20% chance for 2x damage
+    if owned_abilities.get("Critical", False) and random.random() < 0.20:
+        dmg = int(dmg * 2)
+    # Execution (Mythical): enemies below 45% max HP die instantly
+    executed = False
+    if owned_abilities.get("Execution", False) and enemy.hp <= 0.45 * enemy_max and enemy_max > 0:
+        enemy.hp = 0
+        executed = True
+    else:
+        enemy.hp -= dmg
     play_sound("hit")
-    floating_texts.append({"x":enemy.rect.centerx,"y":enemy.rect.top-12,"txt":f"-{int(dmg)}","color":RED,"ttl":1000,"vy":-0.6,"alpha":255})
+    if executed:
+        floating_texts.append({"x":enemy.rect.centerx,"y":enemy.rect.top-12,"txt":"EXECUTE!","color":PURPLE,"ttl":1200,"vy":-0.6,"alpha":255})
+    else:
+        floating_texts.append({"x":enemy.rect.centerx,"y":enemy.rect.top-12,"txt":f"-{int(dmg)}","color":RED,"ttl":1000,"vy":-0.6,"alpha":255})
+
+    # Vampiric (Legendary): heal 8% of arrow damage
+    if owned_abilities.get("Vampiric", False) and not executed and dmg > 0:
+        heal = max(1, int(dmg * 0.08))
+        player_hp = min(max_hp, player_hp + heal)
+        floating_texts.append({"x": player.centerx, "y": player.centery - 20, "txt": f"+{heal}", "color": GREEN, "ttl": 700, "vy": -0.5, "alpha": 255})
 
     try:
         player_class.on_arrow_hit(enemy, dmg)
     except:
         pass
 
-    now = pygame.time.get_ticks()
     if owned_abilities.get("Flame", False):
         enemy.burn_ms_left = 3000; enemy.last_status_tick = now - 1000
+    if owned_abilities.get("Poison", False):
+        enemy.poison_ms_left = 3000
+        enemy.last_status_tick = now - 1000
+    if owned_abilities.get("Frost", False):
+        enemy.slow_until_ms = now + 2000
+    if owned_abilities.get("Haste", False) and random.random() < 0.12:
+        enemy.slow_until_ms = now + 1000
+
+    # Lightning ability: chain to up to 2 nearby enemies (same as Lightning Archer class)
+    if owned_abilities.get("Lightning", False):
+        ox, oy = enemy.rect.centerx, enemy.rect.centery
+        lightning_lines.append({"x1": ox, "y1": oy, "x2": ox, "y2": oy, "ttl": 200})
+        others = [e for e in enemies if e is not enemy and getattr(e, "hp", 0) > 0]
+        others.sort(key=lambda e: math.hypot(e.rect.centerx - ox, e.rect.centery - oy))
+        hit = 0
+        for e in others:
+            if hit >= 2:
+                break
+            dist = math.hypot(e.rect.centerx - ox, e.rect.centery - oy)
+            if dist <= 120:
+                dmg2 = max(1, int(dmg * 0.5))
+                e.hp -= dmg2
+                floating_texts.append({"x": e.rect.centerx, "y": e.rect.top - 12, "txt": f"-{dmg2}", "color": YELLOW, "ttl": 1000, "vy": -0.6, "alpha": 255})
+                lightning_lines.append({"x1": ox, "y1": oy, "x2": e.rect.centerx, "y2": e.rect.centery, "ttl": 260})
+                hit += 1
+                if e.hp <= 0:
+                    record_assassin_kill(e)
+                    spawn_orb(e.rect.centerx, e.rect.centery, amount=1)
+                    globals()["score"] += 1
+                    try: enemies.remove(e)
+                    except: pass
+
+    # Chain Lightning (Legendary): chain to up to 3 enemies, 45% damage
+    if owned_abilities.get("Chain Lightning", False):
+        ox, oy = enemy.rect.centerx, enemy.rect.centery
+        lightning_lines.append({"x1": ox, "y1": oy, "x2": ox, "y2": oy, "ttl": 200})
+        others = [e for e in enemies if e is not enemy and getattr(e, "hp", 0) > 0]
+        others.sort(key=lambda e: math.hypot(e.rect.centerx - ox, e.rect.centery - oy))
+        hit = 0
+        for e in others:
+            if hit >= 3:
+                break
+            dist = math.hypot(e.rect.centerx - ox, e.rect.centery - oy)
+            if dist <= 120:
+                dmg2 = max(1, int(dmg * 0.45))
+                e.hp -= dmg2
+                floating_texts.append({"x": e.rect.centerx, "y": e.rect.top - 12, "txt": f"-{dmg2}", "color": YELLOW, "ttl": 1000, "vy": -0.6, "alpha": 255})
+                lightning_lines.append({"x1": ox, "y1": oy, "x2": e.rect.centerx, "y2": e.rect.centery, "ttl": 260})
+                hit += 1
+                if e.hp <= 0:
+                    record_assassin_kill(e)
+                    spawn_orb(e.rect.centerx, e.rect.centery, amount=1)
+                    globals()["score"] += 1
+                    try: enemies.remove(e)
+                    except: pass
+
+    # Splash (Epic): 30% damage to enemies within 50px
+    if owned_abilities.get("Splash", False) and dmg > 0:
+        splash_dmg = max(1, int(dmg * 0.30))
+        ox, oy = enemy.rect.centerx, enemy.rect.centery
+        for e in enemies[:]:
+            if e is enemy or getattr(e, "hp", 0) <= 0:
+                continue
+            dist = math.hypot(e.rect.centerx - ox, e.rect.centery - oy)
+            if dist <= 50 and dist > 0:
+                e.hp -= splash_dmg
+                floating_texts.append({"x": e.rect.centerx, "y": e.rect.top - 12, "txt": f"-{splash_dmg}", "color": (200, 200, 255), "ttl": 900, "vy": -0.6, "alpha": 255})
+                if e.hp <= 0:
+                    record_assassin_kill(e)
+                    spawn_orb(e.rect.centerx, e.rect.centery, amount=1)
+                    globals()["score"] += 1
+                    try: enemies.remove(e)
+                    except: pass
+
+    # Explosive (Legendary): 25% damage to enemies within 65px
+    if owned_abilities.get("Explosive", False) and dmg > 0:
+        exp_dmg = max(1, int(dmg * 0.25))
+        ox, oy = enemy.rect.centerx, enemy.rect.centery
+        for e in enemies[:]:
+            if e is enemy or getattr(e, "hp", 0) <= 0:
+                continue
+            dist = math.hypot(e.rect.centerx - ox, e.rect.centery - oy)
+            if dist <= 65 and dist > 0:
+                e.hp -= exp_dmg
+                floating_texts.append({"x": e.rect.centerx, "y": e.rect.top - 12, "txt": f"-{exp_dmg}", "color": (255, 180, 80), "ttl": 900, "vy": -0.6, "alpha": 255})
+                if e.hp <= 0:
+                    record_assassin_kill(e)
+                    spawn_orb(e.rect.centerx, e.rect.centery, amount=1)
+                    globals()["score"] += 1
+                    try: enemies.remove(e)
+                    except: pass
+
+    # Ricochet (Rare): 35% chance to hit 1 extra enemy within 90px for 35% damage
+    if owned_abilities.get("Ricochet", False) and dmg > 0 and random.random() < 0.35:
+        ox, oy = enemy.rect.centerx, enemy.rect.centery
+        others = [e for e in enemies if e is not enemy and getattr(e, "hp", 0) > 0]
+        others.sort(key=lambda e: math.hypot(e.rect.centerx - ox, e.rect.centery - oy))
+        for e in others:
+            if math.hypot(e.rect.centerx - ox, e.rect.centery - oy) <= 90:
+                rico_dmg = max(1, int(dmg * 0.35))
+                e.hp -= rico_dmg
+                floating_texts.append({"x": e.rect.centerx, "y": e.rect.top - 12, "txt": f"-{rico_dmg}", "color": (180, 180, 255), "ttl": 900, "vy": -0.6, "alpha": 255})
+                if e.hp <= 0:
+                    record_assassin_kill(e)
+                    spawn_orb(e.rect.centerx, e.rect.centery, amount=1)
+                    globals()["score"] += 1
+                    try: enemies.remove(e)
+                    except: pass
+                break
+
+    # Shatter (Legendary): 35% damage to enemies within 40px
+    if owned_abilities.get("Shatter", False) and dmg > 0:
+        shat_dmg = max(1, int(dmg * 0.35))
+        ox, oy = enemy.rect.centerx, enemy.rect.centery
+        for e in enemies[:]:
+            if e is enemy or getattr(e, "hp", 0) <= 0:
+                continue
+            dist = math.hypot(e.rect.centerx - ox, e.rect.centery - oy)
+            if dist <= 40 and dist > 0:
+                e.hp -= shat_dmg
+                floating_texts.append({"x": e.rect.centerx, "y": e.rect.top - 12, "txt": f"-{shat_dmg}", "color": (200, 100, 150), "ttl": 900, "vy": -0.6, "alpha": 255})
+                if e.hp <= 0:
+                    record_assassin_kill(e)
+                    spawn_orb(e.rect.centerx, e.rect.centery, amount=1)
+                    globals()["score"] += 1
+                    try: enemies.remove(e)
+                    except: pass
 
     if enemy.hp <= 0:
+        if owned_abilities.get("Berserk", False):
+            globals()["berserk_until_ms"] = now + 2500
         record_assassin_kill(enemy)
         spawn_orb(enemy.rect.centerx, enemy.rect.centery, amount=1)
         globals()["score"] += 1
@@ -1596,8 +2079,23 @@ def shoot_bow(mx, my):
     except:
         pass
 
-    play_sound("shoot")
-    if owned_abilities.get("Double Shot", False):
+    play_sound("arrow")
+    num_shots = 4 if owned_abilities.get("Volley", False) else (3 if owned_abilities.get("Triple Shot", False) else (2 if owned_abilities.get("Double Shot", False) else 1))
+    if num_shots == 4:
+        offsets = [(-18, -6), (-6, 6), (6, -6), (18, 6)]
+        for dx, dy in offsets:
+            a = Arrow(player.centerx, player.centery, mx + dx, my + dy, pierce=pierce_level)
+            arrows.append(a)
+            if online_mode and net is not None:
+                net.send_shoot(player.centerx, player.centery, a.vx, a.vy)
+    elif num_shots == 3:
+        offsets = [(-12, 0), (0, 0), (12, 0)]
+        for dx, dy in offsets:
+            a = Arrow(player.centerx, player.centery, mx + dx, my + dy, pierce=pierce_level)
+            arrows.append(a)
+            if online_mode and net is not None:
+                net.send_shoot(player.centerx, player.centery, a.vx, a.vy)
+    elif num_shots == 2:
         a1 = Arrow(player.centerx, player.centery, mx, my - 10, pierce=pierce_level)
         a2 = Arrow(player.centerx, player.centery, mx, my + 10, pierce=pierce_level)
         arrows.append(a1); arrows.append(a2)
@@ -1621,11 +2119,11 @@ CLASS_SHORT_DESC = {
     "Knight": "Deflect + armor",
     "Vampire": "Life steal + fly (V)",
     "Assassin": "Invis + backstab knife (V)",
-    "Mad Scientist": "Curving AI arrows",
+    "Mad Scientist": "Homing + splash, V: Overcharge",
 }
 
 def class_shop_menu():
-    global gems, player_class
+    global gems, player_class, owned_classes
     # Layout: fixed compact class boxes (don't grow on big screens)
     n_classes = len(PLAYER_CLASS_ORDER)
     area_top = 160
@@ -1645,18 +2143,24 @@ def class_shop_menu():
             rect = pygame.Rect(WIDTH//2 - max_w//2, y, max_w, btn_h)
             cost = CLASS_COSTS[cls.name]
             selected = (player_class.name == cls.name)
+            owned = (cls.name in owned_classes)
 
             pygame.draw.rect(screen, LIGHT_GRAY, rect)
             pygame.draw.rect(screen, cls.color, rect, 4)
 
             rarity = class_rarity_label(cls.name)
-            line1 = f"{cls.name} [{rarity}] — {cost} gems" if not selected else f"{cls.name} — Selected"
+            if selected:
+                line1 = f"{cls.name} — Selected"
+            elif owned:
+                line1 = f"{cls.name} [{rarity}] — Owned (click to equip)"
+            else:
+                line1 = f"{cls.name} [{rarity}] — {cost} gems"
             line2 = CLASS_SHORT_DESC.get(cls.name, "")
-            t1 = FONT_MD.render(line1[:42] + ("…" if len(line1) > 42 else ""), True, BLACK)
+            t1 = FONT_MD.render(line1[:48] + ("…" if len(line1) > 48 else ""), True, BLACK)
             t2 = FONT_SM.render(line2, True, DARK_GRAY)
             screen.blit(t1, (rect.x + 12, rect.y + 6))
             screen.blit(t2, (rect.x + 12, rect.y + 34))
-            buttons.append((rect, cls, cost, selected))
+            buttons.append((rect, cls, cost, selected, owned))
 
         back_y = y_start + n_classes * row_h + 8
         back_rect = pygame.Rect(WIDTH//2 - 120, min(back_y, HEIGHT - 60), 240, 56)
@@ -1672,16 +2176,22 @@ def class_shop_menu():
                 save_game(); return
             if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 mx,my = ev.pos
-                for r, cls, cost, selected in buttons:
+                for r, cls, cost, selected, owned in buttons:
                     if r.collidepoint(mx,my):
                         play_sound("menu_click")
                         if selected:
                             return
-                        if gems >= cost:
-                            gems -= cost
+                        if owned:
                             player_class = cls()
                             save_game()
-                            notify_once(f"{cls.name} Selected!", 800)
+                            notify_once(f"{cls.name} equipped!", 800)
+                            return
+                        if gems >= cost:
+                            gems -= cost
+                            owned_classes.add(cls.name)
+                            player_class = cls()
+                            save_game()
+                            notify_once(f"{cls.name} purchased!", 800)
                             return
                         else:
                             notify_once("Not enough Gems!", 800)
@@ -1703,11 +2213,12 @@ def admin_panel():
     right_x = WIDTH//2 + 40
     y_start = 120
 
+    ab_w = 100  # narrower for ability row
     def mk_rects():
         r, rects, labels = 0, [], []
-        def add(x, y, label):
+        def add(x, y, label, w=btn_w):
             nonlocal r
-            rects.append(pygame.Rect(x, y, btn_w, btn_h))
+            rects.append(pygame.Rect(x, y, w, btn_h))
             labels.append(label)
             r += 1
         add(left_x, y_start + 0*row, "Full Heal")
@@ -1722,6 +2233,13 @@ def admin_panel():
         add(right_x, y_start + 2*row, "+5 Knockback")
         add(right_x, y_start + 3*row, "Max Piercing (3)")
         add(right_x, y_start + 4*row, "Back")
+        # Specific abilities row
+        ability_y = y_start + 7*row
+        add(left_x, ability_y, "Flame", ab_w)
+        add(left_x + ab_w + 4, ability_y, "Poison", ab_w)
+        add(left_x + (ab_w+4)*2, ability_y, "Lightning", ab_w)
+        add(left_x + (ab_w+4)*3, ability_y, "Dbl Shot", ab_w)
+        add(left_x + (ab_w+4)*4, ability_y, "Execute", ab_w)
         return rects, labels
 
     rects, labels = mk_rects()
@@ -1757,9 +2275,8 @@ def admin_panel():
                         owned_abilities["Corrosive"] = True
                         corrosive_level = 5
                     elif i == 3:
-                        owned_abilities["Flame"] = owned_abilities["Poison"] = owned_abilities["Lightning"] = True
-                        owned_abilities["Knockback"] = owned_abilities["Piercing"] = True
-                        owned_abilities["Double Shot"] = owned_abilities["Corrosive"] = True
+                        for k in owned_abilities:
+                            owned_abilities[k] = True
                         knockback_level = 5
                         pierce_level = 3
                         corrosive_level = 5
@@ -1784,12 +2301,22 @@ def admin_panel():
                         pierce_level = 3
                     elif i == 11:
                         return
+                    elif i == 12:
+                        owned_abilities["Flame"] = True
+                    elif i == 13:
+                        owned_abilities["Poison"] = True
+                    elif i == 14:
+                        owned_abilities["Lightning"] = True
+                    elif i == 15:
+                        owned_abilities["Double Shot"] = True
+                    elif i == 16:
+                        owned_abilities["Execution"] = True
                     break
         clock.tick(FPS)
 
 def settings_menu():
     global settings, screen, WIDTH, HEIGHT
-    panel_w, panel_h = 380, 320
+    panel_w, panel_h = 380, 260
     panel = pygame.Rect(WIDTH//2 - panel_w//2, HEIGHT//2 - panel_h//2, panel_w, panel_h)
     slider_w, slider_h = 280, 22
     slider_x = panel.centerx - slider_w//2
@@ -1797,7 +2324,6 @@ def settings_menu():
     dragging = None
     back_rect = pygame.Rect(panel.centerx - 90, panel.bottom - 54, 180, 44)
     fullscreen_rect = pygame.Rect(panel.centerx - 100, panel.y + 168, 200, 44)
-    music_rect = pygame.Rect(panel.centerx - 100, panel.y + 228, 200, 44)
     while True:
         screen.fill(bg_color)
         # Panel background and border first
@@ -1825,14 +2351,6 @@ def settings_menu():
         fs_text = "On" if settings.get("fullscreen", True) else "Off"
         fst = FONT_MD.render(fs_text, True, BLACK)
         screen.blit(fst, (fullscreen_rect.x + (fullscreen_rect.w - fst.get_width()) // 2, fullscreen_rect.y + (fullscreen_rect.h - fst.get_height()) // 2 - 1))
-        # Music (black label + toggle)
-        music_label = FONT_MD.render("Music", True, BLACK)
-        screen.blit(music_label, (music_rect.x, music_rect.y - 24))
-        pygame.draw.rect(screen, LIGHT_GRAY if music_rect.collidepoint(mx, my) else (220, 220, 220), music_rect)
-        pygame.draw.rect(screen, BLACK, music_rect, 2)
-        mus_text = "On" if settings.get("music", True) else "Off"
-        mst = FONT_MD.render(mus_text, True, BLACK)
-        screen.blit(mst, (music_rect.x + (music_rect.w - mst.get_width()) // 2, music_rect.y + (music_rect.h - mst.get_height()) // 2 - 1))
         # Back button
         pygame.draw.rect(screen, LIGHT_GRAY if back_rect.collidepoint(mx, my) else (220, 220, 220), back_rect)
         pygame.draw.rect(screen, BLACK, back_rect, 2)
@@ -1853,14 +2371,6 @@ def settings_menu():
                     settings["fullscreen"] = not settings.get("fullscreen", True)
                     apply_display_mode()
                     save_settings()
-                if music_rect.collidepoint(mx, my):
-                    play_sound("menu_click")
-                    settings["music"] = not settings.get("music", True)
-                    if settings["music"]:
-                        start_music()
-                    else:
-                        stop_music()
-                    save_settings()
                 if slider_x <= mx <= slider_x + slider_w and slider_y - 4 <= my <= slider_y + 32:
                     dragging = True
             if ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
@@ -1870,17 +2380,11 @@ def settings_menu():
                 v = max(0, min(1, (mx - slider_x) / slider_w))
                 settings["volume"] = v
                 save_settings()
-                try:
-                    if pygame.mixer.music.get_busy():
-                        pygame.mixer.music.set_volume(0.25 * v)
-                except Exception:
-                    pass
         clock.tick(FPS)
 
 def main_menu():
     global online_mode, current_save_slot
     refresh_all_slot_meta()
-    start_music()
 
     while True:
         screen.fill(bg_color)
@@ -1995,8 +2499,10 @@ def game_over_screen():
     while True:
         screen.fill(bg_color)
         draw_text_centered(FONT_LG, "Game Over", HEIGHT//2 - 100)
-        draw_text_centered(FONT_MD, f"Wave: {wave}  •  Score: {score}  •  Gems this run: {gems_this_run}", HEIGHT//2 - 40)
-        draw_text_centered(FONT_MD, "Click or press Enter to return to menu", HEIGHT//2 + 30)
+        stats = f"Wave: {wave}  •  Score: {score}  •  Gems this run: {gems_this_run}"
+        stats_font = FONT_MD if FONT_MD.render(stats, True, BLACK).get_width() <= WIDTH - 40 else FONT_SM
+        draw_text_centered(stats_font, stats, HEIGHT//2 - 40)
+        draw_text_centered(FONT_SM, "Click or press Enter to return to menu", HEIGHT//2 + 30)
         pygame.display.flip()
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
@@ -2016,6 +2522,7 @@ def game_loop():
     global net
     global vampire_fly_until_ms, vampire_fly_cooldown_until_ms
     global assassin_invis_until_ms, assassin_invis_cooldown_until_ms
+    global mad_scientist_overcharge_until_ms, mad_scientist_overcharge_cooldown_until_ms
     global assassin_active_bounties, assassin_bounty_refresh_at_ms
 
     gems_this_run = 0
@@ -2026,6 +2533,8 @@ def game_loop():
     running = True
     admin_code_buffer = []
     last_corrosive_damage_ms = 0
+    wave_banner_until_ms = 0
+    wave_banner_number = 0
 
     while running:
         dt = clock.tick(FPS)
@@ -2108,6 +2617,11 @@ def game_loop():
                         assassin_invis_until_ms = now_ms + Assassin.INVIS_DURATION_MS
                         assassin_invis_cooldown_until_ms = now_ms + Assassin.INVIS_COOLDOWN_MS
                         floating_texts.append({"x": player.centerx, "y": player.centery - 30, "txt": "Invisible!", "color": PURPLE, "ttl": 800, "vy": -0.5, "alpha": 255})
+                if ev.key == pygame.K_v and isinstance(player_class, MadScientist):
+                    if now_ms >= mad_scientist_overcharge_cooldown_until_ms and now_ms >= mad_scientist_overcharge_until_ms:
+                        mad_scientist_overcharge_until_ms = now_ms + MadScientist.OVERCHARGE_DURATION_MS
+                        mad_scientist_overcharge_cooldown_until_ms = now_ms + MadScientist.OVERCHARGE_COOLDOWN_MS
+                        floating_texts.append({"x": player.centerx, "y": player.centery - 30, "txt": "Overcharge!", "color": (120, 255, 120), "ttl": 800, "vy": -0.5, "alpha": 255})
                 if ev.key == pygame.K_b and isinstance(player_class, Assassin):
                     hit_list_menu()
                     continue
@@ -2116,6 +2630,11 @@ def game_loop():
                         player_exp += orb["amount"]
                         gems += orb["amount"]
                         gems_this_run += orb["amount"]
+                        if owned_abilities.get("Bounty", False) and random.random() < 0.25:
+                            gems += 1
+                            gems_this_run += 1
+                        if owned_abilities.get("Scavenger", False) and random.random() < 0.20:
+                            player_exp += 5
                         try: pending_orbs.remove(orb)
                         except: pass
                     collection_start_ms = now_ms - collection_duration_ms - 1
@@ -2143,6 +2662,11 @@ def game_loop():
                             player_exp += orb["amount"]
                             gems += orb["amount"]
                             gems_this_run += orb["amount"]
+                            if owned_abilities.get("Bounty", False) and random.random() < 0.25:
+                                gems += 1
+                                gems_this_run += 1
+                            if owned_abilities.get("Scavenger", False) and random.random() < 0.20:
+                                player_exp += 5
                             try: pending_orbs.remove(orb)
                             except: pass
                             break
@@ -2206,6 +2730,7 @@ def game_loop():
         if not online_mode:
             if spawn_preview_active and now_ms - spawn_preview_start_ms >= spawn_preview_ms:
                 spawn_preview_active = False
+                globals()["first_arrow_hit_this_wave"] = False
                 if wave % 10 == 0:
                     spawn_boss()
                 else:
@@ -2276,6 +2801,12 @@ def game_loop():
                         dmg = enemy.damage
                         if isinstance(player_class, Knight):
                             dmg = int(math.ceil(dmg*0.90))
+                        if owned_abilities.get("Thorns", False):
+                            enemy.hp -= 8
+                            if enemy.hp <= 0:
+                                record_assassin_kill(enemy)
+                                spawn_orb(enemy.rect.centerx, enemy.rect.centery, amount=1)
+                                globals()["score"] += 1
                         player_hp -= dmg
                         try: enemies.remove(enemy)
                         except: pass
@@ -2345,6 +2876,11 @@ def game_loop():
                         player_exp += orb["amount"]
                         gems += orb["amount"]
                         gems_this_run += orb["amount"]
+                        if owned_abilities.get("Bounty", False) and random.random() < 0.25:
+                            gems += 1
+                            gems_this_run += 1
+                        if owned_abilities.get("Scavenger", False) and random.random() < 0.20:
+                            player_exp += 5
                         try: pending_orbs.remove(orb)
                         except: pass
 
@@ -2353,6 +2889,11 @@ def game_loop():
                         player_exp += orb["amount"]
                         gems += orb["amount"]
                         gems_this_run += orb["amount"]
+                        if owned_abilities.get("Bounty", False) and random.random() < 0.25:
+                            gems += 1
+                            gems_this_run += 1
+                        if owned_abilities.get("Scavenger", False) and random.random() < 0.20:
+                            player_exp += 5
                         try: pending_orbs.remove(orb)
                         except: pass
                     in_collection_phase = False
@@ -2373,10 +2914,22 @@ def game_loop():
                     spawn_preview_start_ms = pygame.time.get_ticks()
                     player.center = (WIDTH//2, HEIGHT//2)
                     wave += 1
+                    wave_banner_number = wave
+                    wave_banner_until_ms = now_ms + 2200
                     enemies_per_wave = max(1, int(round(enemies_per_wave*1.1)))
 
         # ---------- DRAW ----------
         screen.fill(bg_color)
+
+        # Wave banner (after clearing a wave) — fades out in last 0.4s
+        if wave_banner_until_ms and now_ms < wave_banner_until_ms:
+            remain = wave_banner_until_ms - now_ms
+            alpha = 255 if remain > 400 else int(255 * remain / 400)
+            banner_surf = FONT_LG.render(f"Wave {wave_banner_number}", True, (255, 255, 200))
+            if alpha < 255:
+                banner_surf = banner_surf.convert_alpha()
+                banner_surf.set_alpha(alpha)
+            screen.blit(banner_surf, (WIDTH//2 - banner_surf.get_width()//2, HEIGHT//2 - banner_surf.get_height()//2 - 40))
 
         # corrosive field visual (Mythical ability only)
         if owned_abilities.get("Corrosive", False) and corrosive_level >= 1:
@@ -2483,6 +3036,15 @@ def game_loop():
                 ability_txt = FONT_MD.render(f"V invis: {sec}s", True, DARK_GRAY)
             else:
                 ability_txt = FONT_MD.render("V: Invis ready", True, GREEN)
+            screen.blit(ability_txt, (12, 84))
+        if isinstance(player_class, MadScientist):
+            if now_ms < mad_scientist_overcharge_until_ms:
+                ability_txt = FONT_MD.render("Overcharge!", True, (120, 255, 120))
+            elif now_ms < mad_scientist_overcharge_cooldown_until_ms:
+                sec = (mad_scientist_overcharge_cooldown_until_ms - now_ms) // 1000
+                ability_txt = FONT_MD.render(f"V overcharge: {sec}s", True, DARK_GRAY)
+            else:
+                ability_txt = FONT_MD.render("V: Overcharge ready", True, GREEN)
             screen.blit(ability_txt, (12, 84))
 
         # Hit List button (Assassin only)
