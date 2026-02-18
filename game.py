@@ -980,7 +980,7 @@ robbers_gun = "ak47"
 ROBBER_AK_INTERVAL_MS = 111   # 3x faster than ~333ms bow click = ~9/sec
 ROBBER_MINIGUN_CHARGE_MS = 1670
 ROBBER_MINIGUN_FIRE_DURATION_MS = 13142   # 13.141592653s
-ROBBER_MINIGUN_BULLETS_PER_SEC = 10
+ROBBER_MINIGUN_BULLETS_PER_SEC = 25
 ROBBER_MINIGUN_OVERHEAT_MS = 6767
 ROBBER_MINIGUN_DAMAGE_MULT = 1.0 / 3.0
 ROBBER_SHOTGUN_PELLETS = 5
@@ -998,6 +998,7 @@ minigun_overheat_until_ms = 0
 minigun_last_bullet_ms = 0
 last_robber_sniper_ms = 0
 last_robber_flame_tick_ms = 0
+robber_flame_active = False  # True while flamethrower is firing (for drawing cone)
 
 # ---------- CHAT (client + offline) ----------
 chat_open = False
@@ -1188,6 +1189,61 @@ def load_slot_meta(slot):
 def refresh_all_slot_meta():
     for s in (1, 2, 3):
         load_slot_meta(s)
+
+def confirm_popup(message, yes_text="Yes", no_text="No"):
+    """Blocking modal: show message and Yes/No buttons. Returns True if Yes, False if No/Esc."""
+    panel_w, panel_h = 400, 160
+    panel = pygame.Rect(WIDTH//2 - panel_w//2, HEIGHT//2 - panel_h//2, panel_w, panel_h)
+    btn_w, btn_h = 100, 44
+    yes_rect = pygame.Rect(panel.centerx - btn_w - 20, panel.bottom - btn_h - 24, btn_w, btn_h)
+    no_rect = pygame.Rect(panel.centerx + 20, panel.bottom - btn_h - 24, btn_w, btn_h)
+    while True:
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 180))
+        screen.blit(overlay, (0, 0))
+        pygame.draw.rect(screen, (248, 248, 248), panel)
+        pygame.draw.rect(screen, BLACK, panel, 3)
+        mx, my = pygame.mouse.get_pos()
+        # Wrap message to fit panel
+        lines = wrap_text_to_width(FONT_MD, message, panel_w - 40)
+        y = panel.y + 24
+        for line in lines:
+            t = FONT_MD.render(line, True, BLACK)
+            screen.blit(t, (panel.centerx - t.get_width()//2, y))
+            y += t.get_height() + 4
+        for rect, label in [(yes_rect, yes_text), (no_rect, no_text)]:
+            c = LIGHT_GRAY if rect.collidepoint(mx, my) else (220, 220, 220)
+            pygame.draw.rect(screen, c, rect)
+            pygame.draw.rect(screen, BLACK, rect, 2)
+            lt = FONT_MD.render(label, True, BLACK)
+            screen.blit(lt, (rect.x + (rect.w - lt.get_width())//2, rect.y + (rect.h - lt.get_height())//2))
+        pygame.display.flip()
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                return False
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                return False
+            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                if yes_rect.collidepoint(ev.pos):
+                    return True
+                if no_rect.collidepoint(ev.pos):
+                    return False
+        clock.tick(FPS)
+
+def delete_save_slot(slot):
+    """Delete save and meta files for the given slot (1–3). Clears cache for that slot."""
+    global slot_meta_cache
+    s = max(1, min(3, int(slot)))
+    save_path = get_save_path(s)
+    meta_path = get_meta_path(s)
+    for path in (save_path, meta_path):
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+    slot_meta_cache[s] = {"gems": 0, "player_class": "No Class"}
+    refresh_all_slot_meta()
 
 def load_meta_into_game():
     """Load gems, owned_classes, player_class from current slot's meta file (for New Game)."""
@@ -2176,7 +2232,8 @@ def spawn_robber_bullet(mx, my, damage_mult=1.0, spread_deg=0):
 def update_robber_guns(now_ms, mx, my, mouse_held, clicked):
     """Handle Robber gun firing: AK (hold), minigun (charge then auto), shotgun (click), flamethrower (hold), sniper (slow)."""
     global last_robber_ak_ms, minigun_charge_start_ms, minigun_firing_until_ms, minigun_overheat_until_ms, minigun_last_bullet_ms
-    global last_robber_sniper_ms, last_robber_flame_tick_ms
+    global last_robber_sniper_ms, last_robber_flame_tick_ms, score, robber_flame_active
+    robber_flame_active = False
     gun = robbers_gun
     # --- AK-47: automatic, 3x bow rate, hold to fire ---
     if gun == "ak47":
@@ -2219,6 +2276,7 @@ def update_robber_guns(now_ms, mx, my, mouse_held, clicked):
         return
     # --- Flamethrower: AOE cone + 5s burn (tick every 100ms while held) ---
     if gun == "flamethrower":
+        robber_flame_active = mouse_held
         if mouse_held and now_ms - last_robber_flame_tick_ms >= ROBBER_FLAME_TICK_MS:
             last_robber_flame_tick_ms = now_ms
             ang = math.atan2(my - player.centery, mx - player.centerx)
@@ -2670,9 +2728,13 @@ def main_menu():
 
         slot_y = HEIGHT//2 + 360
         slot_w, slot_h = 180, 60
+        del_btn_w, del_btn_h = 56, 24
         slot1 = pygame.Rect(WIDTH//2 - slot_w - 200, slot_y, slot_w, slot_h)
         slot2 = pygame.Rect(WIDTH//2 - slot_w//2, slot_y, slot_w, slot_h)
         slot3 = pygame.Rect(WIDTH//2 + 200, slot_y, slot_w, slot_h)
+        del1 = pygame.Rect(slot1.x + slot1.w - del_btn_w - 8, slot1.y + slot1.h - del_btn_h - 6, del_btn_w, del_btn_h)
+        del2 = pygame.Rect(slot2.x + slot2.w - del_btn_w - 8, slot2.y + slot2.h - del_btn_h - 6, del_btn_w, del_btn_h)
+        del3 = pygame.Rect(slot3.x + slot3.w - del_btn_w - 8, slot3.y + slot3.h - del_btn_h - 6, del_btn_w, del_btn_h)
         for s, r in [(1,slot1),(2,slot2),(3,slot3)]:
             meta = load_slot_meta(s)
             sel = (s==current_save_slot)
@@ -2680,13 +2742,35 @@ def main_menu():
             pygame.draw.rect(screen, fill, r)
             pygame.draw.rect(screen, BLUE if sel else BLACK, r, 4 if sel else 3)
             screen.blit(FONT_MD.render(f"Slot {s}: {int(meta.get('gems',0))}", True, BLACK), (r.x+14, r.y+14))
-
+        for d in [del1, del2, del3]:
+            dc = (255, 180, 180) if d.collidepoint(mx, my) else (240, 200, 200)
+            pygame.draw.rect(screen, dc, d)
+            pygame.draw.rect(screen, RED, d, 1)
+            screen.blit(FONT_XS.render("Delete", True, BLACK), (d.x + (d.w - FONT_XS.size("Delete")[0])//2, d.y + 4))
         pygame.display.flip()
 
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 pygame.quit(); sys.exit()
             if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                if del1.collidepoint(ev.pos):
+                    play_sound("menu_click")
+                    if confirm_popup("Are you sure you want to delete Slot 1? This cannot be undone."):
+                        delete_save_slot(1)
+                        notify_once("Slot 1 deleted", 800)
+                    continue
+                if del2.collidepoint(ev.pos):
+                    play_sound("menu_click")
+                    if confirm_popup("Are you sure you want to delete Slot 2? This cannot be undone."):
+                        delete_save_slot(2)
+                        notify_once("Slot 2 deleted", 800)
+                    continue
+                if del3.collidepoint(ev.pos):
+                    play_sound("menu_click")
+                    if confirm_popup("Are you sure you want to delete Slot 3? This cannot be undone."):
+                        delete_save_slot(3)
+                        notify_once("Slot 3 deleted", 800)
+                    continue
                 if slot1.collidepoint(ev.pos): current_save_slot = 1; notify_once("Selected Slot 1", 400); continue
                 if slot2.collidepoint(ev.pos): current_save_slot = 2; notify_once("Selected Slot 2", 400); continue
                 if slot3.collidepoint(ev.pos): current_save_slot = 3; notify_once("Selected Slot 3", 400); continue
@@ -3227,6 +3311,22 @@ def game_loop():
             tipy = int(player.centery + gun_len * math.sin(ang))
             gun_colors = {"ak47": (60, 60, 60), "minigun": (80, 70, 60), "shotgun": (90, 50, 30), "flamethrower": (200, 100, 0), "sniper": (40, 50, 40)}
             pygame.draw.line(screen, gun_colors.get(robbers_gun, (60, 60, 60)), (player.centerx, player.centery), (tipx, tipy), 5)
+            # Visible flamethrower cone when firing
+            if robbers_gun == "flamethrower" and robber_flame_active:
+                half = ROBBER_FLAME_CONE_ANGLE_RAD / 2
+                cx, cy = player.centerx, player.centery
+                r = ROBBER_FLAME_CONE_RANGE
+                left_ang = ang - half
+                right_ang = ang + half
+                x1 = cx + r * math.cos(left_ang)
+                y1 = cy + r * math.sin(left_ang)
+                x2 = cx + r * math.cos(right_ang)
+                y2 = cy + r * math.sin(right_ang)
+                pts = [(cx, cy), (x1, y1), (x2, y2)]
+                flame_surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+                pygame.draw.polygon(flame_surf, (255, 140, 0, 140), pts)
+                pygame.draw.polygon(flame_surf, (255, 200, 50, 90), [(cx, cy), (cx + 0.7*r*math.cos(left_ang), cy + 0.7*r*math.sin(left_ang)), (cx + 0.7*r*math.cos(right_ang), cy + 0.7*r*math.sin(right_ang))])
+                screen.blit(flame_surf, (0, 0))
         elif not assassin_invis and weapon == "bow":
             bow_len = 60
             arc_rect = pygame.Rect(player.centerx - 12, player.centery - bow_len, 24, bow_len*2)
