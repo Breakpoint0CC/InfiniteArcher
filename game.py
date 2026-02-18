@@ -984,10 +984,13 @@ ROBBER_MINIGUN_BULLETS_PER_SEC = 25
 ROBBER_MINIGUN_OVERHEAT_MS = 6767
 ROBBER_MINIGUN_DAMAGE_MULT = 1.0 / 3.0
 ROBBER_SHOTGUN_PELLETS = 5
+ROBBER_SHOTGUN_MAGAZINE = 5
+ROBBER_SHOTGUN_FIRE_INTERVAL_MS = 500   # 0.5 s between shots
+ROBBER_SHOTGUN_RELOAD_MS = 2500         # 2.5 s reload after 5 shots
 ROBBER_FLAME_TICK_MS = 100
 ROBBER_FLAME_BURN_MS = 5000
-ROBBER_FLAME_CONE_RANGE = 200
-ROBBER_FLAME_CONE_ANGLE_RAD = math.radians(120)
+ROBBER_FLAME_CONE_RANGE = 350           # taller/longer cone
+ROBBER_FLAME_CONE_ANGLE_RAD = math.radians(60)   # narrower cone
 ROBBER_FLAME_DMG_PER_TICK = 0.2   # fraction of arrow_damage per tick
 ROBBER_SNIPER_INTERVAL_MS = 3142  # 3.141592653s
 ROBBER_SNIPER_DAMAGE_MULT = 6.0
@@ -999,6 +1002,9 @@ minigun_last_bullet_ms = 0
 last_robber_sniper_ms = 0
 last_robber_flame_tick_ms = 0
 robber_flame_active = False  # True while flamethrower is firing (for drawing cone)
+shotgun_shots_left = 5
+last_shotgun_shot_ms = 0
+shotgun_reload_until_ms = 0
 
 # ---------- CHAT (client + offline) ----------
 chat_open = False
@@ -1549,6 +1555,9 @@ def reset_game():
     globals()["minigun_last_bullet_ms"] = 0
     globals()["last_robber_sniper_ms"] = 0
     globals()["last_robber_flame_tick_ms"] = 0
+    globals()["shotgun_shots_left"] = ROBBER_SHOTGUN_MAGAZINE
+    globals()["last_shotgun_shot_ms"] = 0
+    globals()["shotgun_reload_until_ms"] = 0
 
     player_level = 1
     player_exp = 0
@@ -2230,11 +2239,16 @@ def spawn_robber_bullet(mx, my, damage_mult=1.0, spread_deg=0):
     arrows.append(a)
 
 def update_robber_guns(now_ms, mx, my, mouse_held, clicked):
-    """Handle Robber gun firing: AK (hold), minigun (charge then auto), shotgun (click), flamethrower (hold), sniper (slow)."""
+    """Handle Robber gun firing: AK (hold), minigun (charge then auto), shotgun (5 shots, 0.5s rate, 2.5s reload), flamethrower (hold), sniper (slow)."""
     global last_robber_ak_ms, minigun_charge_start_ms, minigun_firing_until_ms, minigun_overheat_until_ms, minigun_last_bullet_ms
     global last_robber_sniper_ms, last_robber_flame_tick_ms, score, robber_flame_active
+    global shotgun_shots_left, last_shotgun_shot_ms, shotgun_reload_until_ms
     robber_flame_active = False
     gun = robbers_gun
+    # Shotgun: when reload finishes, refill magazine
+    if shotgun_reload_until_ms and now_ms >= shotgun_reload_until_ms:
+        shotgun_reload_until_ms = 0
+        shotgun_shots_left = ROBBER_SHOTGUN_MAGAZINE
     # --- AK-47: automatic, 3x bow rate, hold to fire ---
     if gun == "ak47":
         if mouse_held and now_ms - last_robber_ak_ms >= ROBBER_AK_INTERVAL_MS:
@@ -2267,12 +2281,18 @@ def update_robber_guns(now_ms, mx, my, mouse_held, clicked):
                     play_sound("arrow")
                     spawn_robber_bullet(mx, my, ROBBER_MINIGUN_DAMAGE_MULT)
         return
-    # --- Shotgun: 5 pellets per click ---
+    # --- Shotgun: 5 shots, 0.5s fire rate, 5 pellets per shot, then 2.5s reload ---
     if gun == "shotgun":
-        if clicked:
+        if shotgun_reload_until_ms and now_ms < shotgun_reload_until_ms:
+            return
+        if (clicked or mouse_held) and shotgun_shots_left > 0 and now_ms - last_shotgun_shot_ms >= ROBBER_SHOTGUN_FIRE_INTERVAL_MS:
+            last_shotgun_shot_ms = now_ms
+            shotgun_shots_left -= 1
             play_sound("arrow")
             for _ in range(ROBBER_SHOTGUN_PELLETS):
                 spawn_robber_bullet(mx, my, 1.0, spread_deg=8)
+            if shotgun_shots_left == 0:
+                shotgun_reload_until_ms = now_ms + ROBBER_SHOTGUN_RELOAD_MS
         return
     # --- Flamethrower: AOE cone + 5s burn (tick every 100ms while held) ---
     if gun == "flamethrower":
@@ -3431,6 +3451,13 @@ def game_loop():
             elif minigun_overheat_until_ms and now_ms < minigun_overheat_until_ms:
                 sec = (minigun_overheat_until_ms - now_ms) / 1000.0
                 charge_txt = FONT_XS.render(f"Minigun cooling {sec:.1f}s", True, DARK_GRAY)
+                screen.blit(charge_txt, (12, 108))
+            if g == "shotgun":
+                if shotgun_reload_until_ms and now_ms < shotgun_reload_until_ms:
+                    sec = (shotgun_reload_until_ms - now_ms) / 1000.0
+                    charge_txt = FONT_XS.render(f"Shotgun reloading {sec:.1f}s", True, ORANGE)
+                else:
+                    charge_txt = FONT_XS.render(f"Shotgun {shotgun_shots_left}/{ROBBER_SHOTGUN_MAGAZINE}", True, BLACK)
                 screen.blit(charge_txt, (12, 108))
 
         # Hit List button (Assassin only)
