@@ -2840,11 +2840,11 @@ def lobby_screen():
             draw_button(back_rect, "Back", hover=back_rect.collidepoint(mx, my), text_color=UI_TEXT)
 
         if not (net and net.connected):
-            draw_text_centered(FONT_MD, "Connecting...", HEIGHT//2 - 160, (200, 200, 100), y_is_center=True)
+            draw_text_centered(FONT_MD, "Connecting...", HEIGHT//2 - 168, (200, 200, 100), y_is_center=True)
             if net and net.last_error:
                 err = (net.last_error[:50] + "..") if len(net.last_error) > 50 else net.last_error
-                draw_text_centered(FONT_XS, err, HEIGHT//2 - 120, (220, 120, 120), y_is_center=True)
-            draw_text_centered(FONT_XS, "Start server: python game.py --server", HEIGHT//2 - 90, (140, 140, 140), y_is_center=True)
+                draw_text_centered(FONT_XS, err, HEIGHT//2 - 148, (220, 120, 120), y_is_center=True)
+            draw_text_centered(FONT_XS, "Start server: python game.py --server", HEIGHT//2 - 132, (140, 140, 140), y_is_center=True)
         else:
             draw_text_centered(FONT_XS, "Create a new lobby or join one with name + password", HEIGHT//2 - 250, (160, 160, 160), y_is_center=True)
         pygame.display.flip()
