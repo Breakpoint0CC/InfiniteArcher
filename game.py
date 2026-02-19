@@ -355,7 +355,7 @@ class NetClient:
                     ping_interval=30,
                     ping_timeout=10,
                     max_size=2_000_000,
-                    open_timeout=3,
+                    open_timeout=5,
                     close_timeout=2,
                 ) as ws:
                     self._ws = ws
@@ -368,7 +368,9 @@ class NetClient:
                         except Exception:
                             continue
                         t = data.get("type")
-                        if t == "hello":
+                        if t == "welcome":
+                            self.last_status = "CONNECTED"
+                        elif t == "hello":
                             self.id = data.get("id")
                             self.last_status = "ONLINE"
                             try:
@@ -650,7 +652,10 @@ async def run_server(host="0.0.0.0", port=8765, tick_hz=20):
         pid = None
         user_id = None
         lobby_id = None
-
+        try:
+            await ws.send(json.dumps({"type": "welcome"}))
+        except Exception:
+            pass
         try:
             async for msg in ws:
                 try:
@@ -1550,7 +1555,7 @@ def load_slot_meta(slot):
 def refresh_all_slot_meta():
     if online_mode and net is not None and net.connected:
         net.send_meta_get(None)
-        for _ in range(80):
+        for _ in range(100):  # ~5 sec at 20 fps
             pygame.event.pump()
             r = net.get_meta_result()
             if r is not None and r.get("slots"):
@@ -1621,7 +1626,7 @@ def load_meta_into_game():
     global gems, owned_classes, player_class
     if online_mode and net is not None and net.connected:
         net.send_meta_get(current_save_slot)
-        for _ in range(80):
+        for _ in range(100):  # ~5 sec at 20 fps
             pygame.event.pump()
             r = net.get_meta_result()
             if r is not None and r.get("data"):
@@ -1746,7 +1751,7 @@ def load_game():
 
     if online_mode and net is not None and net.connected:
         net.send_load(current_save_slot)
-        for _ in range(120):
+        for _ in range(100):  # ~5 sec at 20 fps
             pygame.event.pump()
             r = net.get_load_result()
             if r is not None:
@@ -2836,6 +2841,10 @@ def lobby_screen():
 
         if not (net and net.connected):
             draw_text_centered(FONT_MD, "Connecting...", HEIGHT//2 - 160, (200, 200, 100), y_is_center=True)
+            if net and net.last_error:
+                err = (net.last_error[:50] + "..") if len(net.last_error) > 50 else net.last_error
+                draw_text_centered(FONT_XS, err, HEIGHT//2 - 120, (220, 120, 120), y_is_center=True)
+            draw_text_centered(FONT_XS, "Start server: python game.py --server", HEIGHT//2 - 90, (140, 140, 140), y_is_center=True)
         else:
             draw_text_centered(FONT_XS, "Create a new lobby or join one with name + password", HEIGHT//2 - 250, (160, 160, 160), y_is_center=True)
         pygame.display.flip()
