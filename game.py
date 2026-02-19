@@ -2844,11 +2844,12 @@ def lobby_screen():
             if net and net.last_error:
                 err = net.last_error
                 if "61" in err or "refused" in err.lower() or "Connection refused" in err:
-                    err = "Connection refused. Start the server first."
+                    draw_text_centered(FONT_SM, "Run in a terminal:  python game.py --server", HEIGHT//2 - 142, (220, 180, 120), y_is_center=True)
                 else:
                     err = (err[:50] + "..") if len(err) > 50 else err
-                draw_text_centered(FONT_XS, err, HEIGHT//2 - 148, (220, 120, 120), y_is_center=True)
-            draw_text_centered(FONT_XS, "Start server: python game.py --server", HEIGHT//2 - 132, (140, 140, 140), y_is_center=True)
+                    draw_text_centered(FONT_XS, err, HEIGHT//2 - 148, (220, 120, 120), y_is_center=True)
+            else:
+                draw_text_centered(FONT_XS, "Run in a terminal:  python game.py --server", HEIGHT//2 - 132, (140, 140, 140), y_is_center=True)
         else:
             draw_text_centered(FONT_XS, "Create a new lobby or join one with name + password", HEIGHT//2 - 250, (160, 160, 160), y_is_center=True)
         pygame.display.flip()
