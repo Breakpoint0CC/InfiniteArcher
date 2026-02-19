@@ -327,7 +327,9 @@ class NetClient:
         self.enemies = {}
         self.shots = []
         self.chat = []
-        self._lobby_status = None  # "created" | "joined" | ("error", msg)
+        self._lobby_status = None
+        self._load_result = None   # {"slot", "data", "error"} from server
+        self._meta_result = None  # {"slots"} or {"slot", "data", "error"}
         self._last_send_ms = 0
 
     def start(self):
@@ -350,11 +352,11 @@ class NetClient:
                 self.last_error = ""
                 async with websockets.connect(
                     self.url,
-                    ping_interval=20,
-                    ping_timeout=20,
+                    ping_interval=30,
+                    ping_timeout=10,
                     max_size=2_000_000,
-                    open_timeout=6,
-                    close_timeout=3,
+                    open_timeout=3,
+                    close_timeout=2,
                 ) as ws:
                     self._ws = ws
                     self.connected = True
@@ -369,6 +371,16 @@ class NetClient:
                         if t == "hello":
                             self.id = data.get("id")
                             self.last_status = "ONLINE"
+                            try:
+                                await ws.send(json.dumps({"type": "identify", "username": str(ONLINE_USERNAME)[:64]}))
+                            except Exception:
+                                pass
+                        elif t == "load_result":
+                            with self._lock:
+                                self._load_result = {"slot": data.get("slot"), "data": data.get("data"), "error": data.get("error")}
+                        elif t == "meta_result":
+                            with self._lock:
+                                self._meta_result = {"slots": data.get("slots"), "slot": data.get("slot"), "data": data.get("data"), "error": data.get("error")}
                         elif t == "lobby_created":
                             with self._lock:
                                 self._lobby_status = "created"
@@ -400,7 +412,7 @@ class NetClient:
                 self.last_status = "RECONNECTING" if self.id else "DISCONNECTED"
                 self.last_error = str(e)
 
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.3)
 
     def send_input_throttled(self, x, y, weapon):
         if not self.connected or self._ws is None or self._loop is None:
@@ -472,6 +484,77 @@ class NetClient:
         with self._lock:
             out = self._lobby_status
             self._lobby_status = None
+        return out
+
+    def send_save(self, slot: int, data: dict):
+        if not self.connected or self._ws is None or self._loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._ws.send(json.dumps({"type": "save", "slot": max(1, min(3, slot)), "data": data})),
+                self._loop,
+            )
+        except Exception as e:
+            self.last_error = str(e)
+
+    def send_load(self, slot: int):
+        if not self.connected or self._ws is None or self._loop is None:
+            return
+        with self._lock:
+            self._load_result = None
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._ws.send(json.dumps({"type": "load", "slot": max(1, min(3, slot))})),
+                self._loop,
+            )
+        except Exception as e:
+            self.last_error = str(e)
+
+    def send_meta_get(self, slot=None):
+        if not self.connected or self._ws is None or self._loop is None:
+            return
+        with self._lock:
+            self._meta_result = None
+        try:
+            payload = {"type": "meta_get"}
+            if slot is not None:
+                payload["slot"] = max(1, min(3, slot))
+            asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(payload)), self._loop)
+        except Exception as e:
+            self.last_error = str(e)
+
+    def send_meta_set(self, slot: int, data: dict):
+        if not self.connected or self._ws is None or self._loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._ws.send(json.dumps({"type": "meta_set", "slot": max(1, min(3, slot)), "data": data})),
+                self._loop,
+            )
+        except Exception as e:
+            self.last_error = str(e)
+
+    def send_delete_save(self, slot: int):
+        if not self.connected or self._ws is None or self._loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._ws.send(json.dumps({"type": "delete_save", "slot": max(1, min(3, slot))})),
+                self._loop,
+            )
+        except Exception as e:
+            self.last_error = str(e)
+
+    def get_load_result(self):
+        with self._lock:
+            out = self._load_result
+            self._load_result = None
+        return out
+
+    def get_meta_result(self):
+        with self._lock:
+            out = self._meta_result
+            self._meta_result = None
         return out
 
     def snapshot(self):
@@ -825,7 +908,7 @@ async def run_server(host="0.0.0.0", port=8765, tick_hz=20):
                         pass
             await asyncio.sleep(1.0 / float(tick_hz))
 
-    async with websockets.serve(handler, host, port, ping_interval=20, ping_timeout=20, max_size=2_000_000):
+    async with websockets.serve(handler, host, port, ping_interval=30, ping_timeout=10, max_size=2_000_000):
         print(f"Infinite Archer server running on ws://{host}:{port}")
         await tick_loop()
 
@@ -1435,9 +1518,11 @@ slot_meta_cache = {1: {"gems":0,"player_class":"No Class"},
                    3: {"gems":0,"player_class":"No Class"}}
 
 def load_slot_meta(slot):
-    """Read meta for menu display (gems, player_class) from slot's meta file."""
-    path = get_meta_path(slot)
+    """Read meta for menu display. When online, use cache (filled by refresh_all_slot_meta)."""
     slot = int(slot)
+    if online_mode and net is not None and net.connected:
+        return slot_meta_cache.get(slot, {"gems": 0, "player_class": "No Class"})
+    path = get_meta_path(slot)
     if not os.path.exists(path):
         # Fallback: read from run save file if no meta file yet
         run_path = get_save_path(slot)
@@ -1463,6 +1548,16 @@ def load_slot_meta(slot):
         return slot_meta_cache[slot]
 
 def refresh_all_slot_meta():
+    if online_mode and net is not None and net.connected:
+        net.send_meta_get(None)
+        for _ in range(80):
+            pygame.event.pump()
+            r = net.get_meta_result()
+            if r is not None and r.get("slots"):
+                for s, m in r["slots"].items():
+                    slot_meta_cache[int(s)] = {"gems": int(m.get("gems", 0)), "player_class": str(m.get("player_class", "No Class"))}
+                return
+            clock.tick(20)
     for s in (1, 2, 3):
         load_slot_meta(s)
 
@@ -1504,23 +1599,53 @@ def confirm_popup(message, yes_text="Yes", no_text="No"):
         clock.tick(FPS)
 
 def delete_save_slot(slot):
-    """Delete save and meta files for the given slot (1–3). Clears cache for that slot."""
+    """Delete save and meta for the given slot (1–3). When online, tell server."""
     global slot_meta_cache
     s = max(1, min(3, int(slot)))
-    save_path = get_save_path(s)
-    meta_path = get_meta_path(s)
-    for path in (save_path, meta_path):
-        if os.path.isfile(path):
-            try:
-                os.remove(path)
-            except Exception:
-                pass
+    if online_mode and net is not None and net.connected:
+        net.send_delete_save(s)
+    else:
+        save_path = get_save_path(s)
+        meta_path = get_meta_path(s)
+        for path in (save_path, meta_path):
+            if os.path.isfile(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
     slot_meta_cache[s] = {"gems": 0, "player_class": "No Class"}
     refresh_all_slot_meta()
 
 def load_meta_into_game():
-    """Load gems, owned_classes, player_class from current slot's meta file (for New Game)."""
+    """Load gems, owned_classes, player_class from current slot (file or server when online)."""
     global gems, owned_classes, player_class
+    if online_mode and net is not None and net.connected:
+        net.send_meta_get(current_save_slot)
+        for _ in range(80):
+            pygame.event.pump()
+            r = net.get_meta_result()
+            if r is not None and r.get("data"):
+                data = r["data"]
+                gems = int(data.get("gems", 0))
+                raw = data.get("owned_classes", [])
+                owned_classes.clear()
+                if isinstance(raw, list):
+                    for c in raw:
+                        if isinstance(c, str) and c.strip():
+                            owned_classes.add(c.strip())
+                if not owned_classes:
+                    owned_classes.add("No Class")
+                class_name = str(data.get("player_class", "No Class"))
+                if class_name not in owned_classes:
+                    owned_classes.add(class_name)
+                for cls in PLAYER_CLASS_ORDER:
+                    if cls.name == class_name:
+                        player_class = cls()
+                        return
+                player_class = NoClass()
+                return
+            clock.tick(20)
+        return
     path = get_meta_path()
     if not os.path.exists(path):
         return
@@ -1548,11 +1673,10 @@ def load_meta_into_game():
         pass
 
 def save_meta():
-    """Write current slot's meta file (gems, owned_classes, player_class) so New Game keeps them."""
+    """Write current slot's meta (gems, owned_classes, player_class). When online, send to server."""
     try:
-        # Merge with existing meta so we never lose a purchased class (e.g. when saving an older run)
         existing_classes = set()
-        if os.path.exists(get_meta_path()):
+        if not (online_mode and net is not None and net.connected) and os.path.exists(get_meta_path()):
             try:
                 with open(get_meta_path(), "r") as f:
                     existing = json.load(f)
@@ -1564,6 +1688,10 @@ def save_meta():
         merged = existing_classes | (owned_classes if owned_classes else {player_class.name})
         classes_to_save = list(merged)
         data = {"gems": gems, "owned_classes": classes_to_save, "player_class": player_class.name}
+        if online_mode and net is not None and net.connected:
+            net.send_meta_set(current_save_slot, data)
+            slot_meta_cache[current_save_slot] = {"gems": gems, "player_class": player_class.name}
+            return
         with open(get_meta_path(), "w") as f:
             json.dump(data, f)
         load_slot_meta(current_save_slot)
@@ -1574,7 +1702,6 @@ def save_meta():
 def save_game():
     global owned_classes
     try:
-        # Never save empty owned_classes — persist at least current class
         classes_to_save = list(owned_classes) if owned_classes else [player_class.name]
         data = {
             "player": [player.x, player.y, player.width, player.height],
@@ -1599,8 +1726,12 @@ def save_game():
             "assassin_active_bounties": assassin_active_bounties,
             "assassin_bounty_refresh_remaining_ms": max(0, assassin_bounty_refresh_at_ms - pygame.time.get_ticks()),
         }
-        with open(get_save_path(),"w") as f:
-            json.dump(data,f)
+        if online_mode and net is not None and net.connected:
+            net.send_save(current_save_slot, data)
+            save_meta()
+            return
+        with open(get_save_path(), "w") as f:
+            json.dump(data, f)
         save_meta()
     except Exception as e:
         print("Save failed:", e)
@@ -1613,13 +1744,30 @@ def load_game():
     global assassin_invis_until_ms, assassin_invis_cooldown_until_ms
     global assassin_kills, assassin_completed_bounties, assassin_active_bounties, assassin_bounty_refresh_at_ms
 
-    if not os.path.exists(get_save_path()):
-        return False
-    try:
-        with open(get_save_path(),"r") as f:
-            data = json.load(f)
+    if online_mode and net is not None and net.connected:
+        net.send_load(current_save_slot)
+        for _ in range(120):
+            pygame.event.pump()
+            r = net.get_load_result()
+            if r is not None:
+                if r.get("error") == "no_save" or r.get("data") is None:
+                    return False
+                data = r["data"]
+                break
+            clock.tick(20)
+        else:
+            return False
+    else:
+        if not os.path.exists(get_save_path()):
+            return False
+        try:
+            with open(get_save_path(), "r") as f:
+                data = json.load(f)
+        except Exception:
+            return False
 
-        px,py,w,h = data.get("player",[WIDTH//2, HEIGHT//2, 40, 40])
+    try:
+        px, py, w, h = data.get("player", [WIDTH//2, HEIGHT//2, 40, 40])
 
         player.x, player.y, player.width, player.height = px,py,w,h
 
@@ -3132,7 +3280,6 @@ def main_menu():
                     return "new"
                 if resume_rect.collidepoint(ev.pos):
                     play_sound("menu_click")
-                    online_mode = False
                     reset_game()
                     if load_game():
                         notify_once("Loaded Save", 700)
