@@ -913,9 +913,17 @@ async def run_server(host="0.0.0.0", port=8765, tick_hz=20):
                         pass
             await asyncio.sleep(1.0 / float(tick_hz))
 
-    async with websockets.serve(handler, host, port, ping_interval=30, ping_timeout=10, max_size=2_000_000):
-        print(f"Infinite Archer server running on ws://{host}:{port}")
-        await tick_loop()
+    try:
+        async with websockets.serve(handler, host, port, ping_interval=30, ping_timeout=10, max_size=2_000_000):
+            print(f"Infinite Archer server: ws://127.0.0.1:{port} (this machine)")
+            print(f"  Client connects to that URL. Press Ctrl+C to stop.")
+            await tick_loop()
+    except OSError as e:
+        if "48" in str(e) or "in use" in str(e).lower() or "Address already" in str(e):
+            print(f"Port {port} already in use. Stop the other process or use a different port.")
+        else:
+            print(f"Server failed to start: {e}")
+        raise
 
 # ========== END PART 1 ==========
 
@@ -2021,7 +2029,7 @@ def reset_game():
         online_mode = False
 
     if ONLINE_ENABLED and online_mode and websockets is not None:
-        url = os.environ.get("IA_SERVER", "ws://localhost:8765")
+        url = os.environ.get("IA_SERVER", "ws://127.0.0.1:8765")
         net = NetClient(url)
         net.start()
     else:
