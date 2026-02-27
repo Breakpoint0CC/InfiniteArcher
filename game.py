@@ -2,7 +2,10 @@
 # Infinite Archer — game.py
 # FULL REPLACEMENT (PART 1/3)
 # =========================
-import os, sys, json, math, random, time, threading, asyncio
+import os
+import sys
+
+import json, math, random, time, threading, asyncio
 import wave
 import io
 import base64
@@ -10,32 +13,62 @@ import struct
 
 
 def _ensure_dependencies():
-    """Auto-install missing dependencies (pygame, websockets) then re-run."""
+    """Ensure pygame is installed. Auto-create venv and install if missing."""
     try:
-        import pygame  # noqa: F401
+        import pygame  # type: ignore[import-untyped]  # noqa: F401
+        return
     except ImportError:
+        pass
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    req_file = os.path.join(script_dir, "requirements.txt")
+    if not os.path.isfile(req_file):
+        req_file = None
+    in_venv = getattr(sys, "prefix", None) != getattr(sys, "base_prefix", None)
+    # Try 1: if not in a venv, create one and re-run from it (prefer 3.13/3.12/3.11 for pygame wheels)
+    if not in_venv and req_file:
+        venv_dir = os.path.join(script_dir, "venv")
+        venv_py = os.path.join(venv_dir, "bin", "python") if os.name != "nt" else os.path.join(venv_dir, "Scripts", "python.exe")
+        if not os.path.isfile(venv_py):
+            import subprocess
+            import shutil
+            venv_python = None
+            for name in ("python3.13", "python3.12", "python3.11", "python3"):
+                path = shutil.which(name)
+                if path:
+                    venv_python = path
+                    break
+            if venv_python is None:
+                venv_python = sys.executable
+            print("Creating virtual environment and installing dependencies...")
+            try:
+                subprocess.check_call([venv_python, "-m", "venv", venv_dir])
+                subprocess.check_call([venv_py, "-m", "pip", "install", "-q", "-r", req_file])
+                print("Done. Launching game...")
+                os.execv(venv_py, [venv_py] + sys.argv)
+            except (subprocess.CalledProcessError, OSError) as e:
+                print(f"Could not set up venv: {e}")
+    # Try 2: pip install into current interpreter (works if already in a venv)
+    if req_file:
+        print("Installing dependencies...")
         import subprocess
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        req_file = os.path.join(script_dir, "requirements.txt")
-        if os.path.exists(req_file):
+        try:
             subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "-r", req_file])
-        else:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "pygame", "websockets"])
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+            print("Done. Re-run: python game.py")
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except (subprocess.CalledProcessError, OSError):
+            pass
+    print("Infinite Archer needs pygame.")
+    print("Install in a virtual environment:")
+    print("  python3 -m venv venv")
+    print("  source venv/bin/activate   # Windows: venv\\Scripts\\activate")
+    print("  pip install -r requirements.txt")
+    print("  python game.py")
+    sys.exit(1)
 
 
 _ensure_dependencies()
 
-# Headless safe mode for server (no window needed)
-if "--server" in sys.argv:
-    os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
-
-try:
-    import websockets
-except Exception:
-    websockets = None
-
-import pygame
+import pygame  # type: ignore[import-untyped]
 pygame.init()
 
 # ---------- CONFIG ----------
@@ -43,16 +76,6 @@ DEFAULT_WIDTH, DEFAULT_HEIGHT = 1280, 800
 SAVE_SLOTS = ["save1.json", "save2.json", "save3.json"]
 current_save_slot = 1  # 1..3
 SETTINGS_FILE = "settings.json"
-
-# Online defaults
-ONLINE_USERNAME = os.environ.get("IA_NAME", "Player")
-
-# Online is temporarily disabled ("online closed")
-ONLINE_ENABLED = True
-
-online_mode = False
-online_coop_enemies = True  # server-authoritative enemies
-net = None
 
 # Settings (volume, fullscreen); loaded on startup
 def load_settings():
@@ -107,12 +130,11 @@ FPS = 60
 # ---------- SOUND ----------
 _sounds = {}
 _mixer_ok = False
-if "--server" not in sys.argv:
-    try:
-        pygame.mixer.init(44100, -16, 2, 512)
-        _mixer_ok = True
-    except Exception:
-        pass
+try:
+    pygame.mixer.init(44100, -16, 2, 512)
+    _mixer_ok = True
+except Exception:
+    pass
 
 def _make_tone(freq, duration_sec=0.08, volume=0.2):
     sample_rate = 44100
@@ -306,592 +328,8 @@ def wrap_text_to_width(font, text, max_pixel_width):
         lines.append(" ".join(current))
     return lines
 
-# ---------- ONLINE (CLIENT) ----------
-# Fixes:
-# - Less lag: send input at 20hz, not every frame
-# - Ghost player fix: server only broadcasts players after first input (active=True)
-# - Remote arrows: server broadcasts "shots"; clients render them
+# (Online/server code removed; add back later)
 
-class NetClient:
-    def __init__(self, url):
-        self.url = url
-        self.id = None
-        self.connected = False
-        self.last_error = ""
-        self.last_status = "DISCONNECTED"
-
-        self._loop = None
-        self._ws = None
-        self._lock = threading.Lock()
-
-        self.players = {}
-        self.enemies = {}
-        self.shots = []
-        self.chat = []
-        self._lobby_status = None
-        self._load_result = None   # {"slot", "data", "error"} from server
-        self._meta_result = None  # {"slots"} or {"slot", "data", "error"}
-        self._last_send_ms = 0
-
-    def start(self):
-        threading.Thread(target=self._run, daemon=True).start()
-
-    def _run(self):
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._main())
-
-    async def _main(self):
-        if websockets is None:
-            self.last_status = "NO_WEBSOCKETS"
-            self.last_error = "websockets package not installed"
-            return
-
-        while True:
-            try:
-                self.last_status = "CONNECTING"
-                self.last_error = ""
-                async with websockets.connect(
-                    self.url,
-                    ping_interval=30,
-                    ping_timeout=10,
-                    max_size=2_000_000,
-                    open_timeout=5,
-                    close_timeout=2,
-                ) as ws:
-                    self._ws = ws
-                    self.connected = True
-                    self.last_status = "CONNECTED"
-
-                    async for msg in ws:
-                        try:
-                            data = json.loads(msg)
-                        except Exception:
-                            continue
-                        t = data.get("type")
-                        if t == "welcome":
-                            self.last_status = "CONNECTED"
-                        elif t == "hello":
-                            self.id = data.get("id")
-                            self.last_status = "ONLINE"
-                            try:
-                                await ws.send(json.dumps({"type": "identify", "username": str(ONLINE_USERNAME)[:64]}))
-                            except Exception:
-                                pass
-                        elif t == "load_result":
-                            with self._lock:
-                                self._load_result = {"slot": data.get("slot"), "data": data.get("data"), "error": data.get("error")}
-                        elif t == "meta_result":
-                            with self._lock:
-                                self._meta_result = {"slots": data.get("slots"), "slot": data.get("slot"), "data": data.get("data"), "error": data.get("error")}
-                        elif t == "lobby_created":
-                            with self._lock:
-                                self._lobby_status = "created"
-                        elif t == "lobby_joined":
-                            with self._lock:
-                                self._lobby_status = "joined"
-                        elif t == "lobby_error":
-                            with self._lock:
-                                self._lobby_status = ("error", str(data.get("msg", "Unknown error")))
-                        elif t == "state":
-                            with self._lock:
-                                self.players = data.get("players", {})
-                        elif t == "enemies":
-                            with self._lock:
-                                self.enemies = {str(e.get("id")): e for e in data.get("enemies", [])}
-                        elif t == "shots":
-                            # server sends a batch of recent shots
-                            shots = data.get("shots", [])
-                            with self._lock:
-                                self.shots = shots[-80:]  # cap
-                        elif t == "chat":
-                            msgs = data.get("messages", [])
-                            with self._lock:
-                                self.chat = msgs[-60:]
-
-            except Exception as e:
-                self.connected = False
-                self._ws = None
-                self.last_status = "RECONNECTING" if self.id else "DISCONNECTED"
-                self.last_error = str(e)
-
-            await asyncio.sleep(0.3)
-
-    def _send(self, payload: dict):
-        """Thread-safe send; sets last_error on failure."""
-        if not self.connected or self._ws is None or self._loop is None:
-            return False
-        try:
-            asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(payload)), self._loop)
-            return True
-        except Exception as e:
-            self.last_error = str(e)
-            return False
-
-    def send_input_throttled(self, x, y, weapon):
-        if not self.connected or self._ws is None or self._loop is None:
-            return
-        now = pygame.time.get_ticks()
-        if now - self._last_send_ms < 50:  # 20hz
-            return
-        self._last_send_ms = now
-        self._send({"type":"input","x":float(x),"y":float(y),"weapon":weapon,"name":str(ONLINE_USERNAME)[:16]})
-
-    def send_shoot(self, x, y, vx, vy):
-        self._send({"type":"shoot","x":float(x),"y":float(y),"vx":float(vx),"vy":float(vy)})
-
-    def send_hit(self, enemy_id, dmg):
-        self._send({"type":"hit","enemy_id":str(enemy_id),"dmg":float(dmg)})
-
-    def send_chat(self, msg: str):
-        self._send({"type": "chat", "msg": str(msg)[:160], "name": str(ONLINE_USERNAME)[:16]})
-
-    def send_create_lobby(self, name: str, password: str):
-        if not self.connected or self._ws is None or self._loop is None:
-            return
-        with self._lock:
-            self._lobby_status = None
-        self._send({"type": "create_lobby", "name": str(name)[:32], "password": str(password)[:32]})
-
-    def send_join_lobby(self, name: str, password: str):
-        if not self.connected or self._ws is None or self._loop is None:
-            return
-        with self._lock:
-            self._lobby_status = None
-        self._send({"type": "join_lobby", "name": str(name)[:32], "password": str(password)[:32]})
-
-    def get_lobby_status(self):
-        with self._lock:
-            out = self._lobby_status
-            self._lobby_status = None
-        return out
-
-    def send_save(self, slot: int, data: dict):
-        self._send({"type": "save", "slot": max(1, min(3, slot)), "data": data})
-
-    def send_load(self, slot: int):
-        if not self.connected or self._ws is None or self._loop is None:
-            return
-        with self._lock:
-            self._load_result = None
-        self._send({"type": "load", "slot": max(1, min(3, slot))})
-
-    def send_meta_get(self, slot=None):
-        if not self.connected or self._ws is None or self._loop is None:
-            return
-        with self._lock:
-            self._meta_result = None
-        payload = {"type": "meta_get"}
-        if slot is not None:
-            payload["slot"] = max(1, min(3, slot))
-        self._send(payload)
-
-    def send_meta_set(self, slot: int, data: dict):
-        self._send({"type": "meta_set", "slot": max(1, min(3, slot)), "data": data})
-
-    def send_delete_save(self, slot: int):
-        self._send({"type": "delete_save", "slot": max(1, min(3, slot))})
-
-    def get_load_result(self, expected_slot=None):
-        """Return load result; if expected_slot is set, only return when result slot matches (ignore stale)."""
-        with self._lock:
-            out = self._load_result
-            if out is not None and expected_slot is not None:
-                got_slot = out.get("slot")
-                if got_slot is not None and got_slot != expected_slot:
-                    return None  # wrong slot, keep for later
-            if out is not None:
-                self._load_result = None
-        return out
-
-    def get_meta_result(self, expected_slot=None):
-        """Return meta result. For single-slot (data), expected_slot must match; for 'slots' dict, ignore slot."""
-        with self._lock:
-            out = self._meta_result
-            if out is not None:
-                if out.get("slots") is not None:
-                    pass  # full slots response, always accept
-                elif expected_slot is not None and out.get("slot") is not None and out.get("slot") != expected_slot:
-                    return None
-            if out is not None:
-                self._meta_result = None
-        return out
-
-    def snapshot(self):
-        with self._lock:
-            return dict(self.players), dict(self.enemies), list(self.shots), list(self.chat)
-
-# ---------- ONLINE (SERVER) ----------
-import sqlite3
-
-SERVER_DB_PATH = "infinite_archer.db"
-
-
-def _db_init():
-    conn = sqlite3.connect(SERVER_DB_PATH)
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS saves (
-            user_id TEXT NOT NULL, slot INTEGER NOT NULL, data TEXT NOT NULL, updated_at REAL NOT NULL,
-            PRIMARY KEY (user_id, slot));
-        CREATE TABLE IF NOT EXISTS meta (
-            user_id TEXT NOT NULL, slot INTEGER NOT NULL, data TEXT NOT NULL, updated_at REAL NOT NULL,
-            PRIMARY KEY (user_id, slot));
-    """)
-    conn.commit()
-    conn.close()
-
-
-def _db_save(user_id, slot, data, kind):
-    conn = sqlite3.connect(SERVER_DB_PATH)
-    now = time.time()
-    tbl = "saves" if kind == "save" else "meta"
-    conn.execute(
-        f"INSERT INTO {tbl} (user_id, slot, data, updated_at) VALUES (?, ?, ?, ?)"
-        " ON CONFLICT(user_id, slot) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at",
-        (user_id, slot, json.dumps(data), now),
-    )
-    conn.commit()
-    conn.close()
-
-
-def _db_load(user_id, slot, kind):
-    conn = sqlite3.connect(SERVER_DB_PATH)
-    tbl = "saves" if kind == "save" else "meta"
-    row = conn.execute(f"SELECT data FROM {tbl} WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone()
-    conn.close()
-    return json.loads(row[0]) if row else None
-
-
-def _db_meta_all(user_id):
-    conn = sqlite3.connect(SERVER_DB_PATH)
-    rows = conn.execute("SELECT slot, data FROM meta WHERE user_id = ?", (user_id,)).fetchall()
-    conn.close()
-    return {slot: json.loads(data) for slot, data in rows}
-
-
-def _db_delete_save(user_id, slot):
-    conn = sqlite3.connect(SERVER_DB_PATH)
-    conn.execute("DELETE FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot))
-    conn.execute("DELETE FROM meta WHERE user_id = ? AND slot = ?", (user_id, slot))
-    conn.commit()
-    conn.close()
-
-
-async def run_server(host="0.0.0.0", port=8765, tick_hz=20):
-    if websockets is None:
-        print("websockets not installed. Run: python -m pip install websockets")
-        return
-
-    import uuid
-    _db_init()
-    lobbies = {}  # lobby_id -> { name, password, connections: set(ws), players, enemies, shots, chat, wave, enemies_per_wave, next_enemy_id }
-    ws_lobby = {}  # ws -> lobby_id
-    ws_pid = {}    # ws -> pid
-    ws_user = {}   # ws -> user_id for cloud saves
-
-    def spawn_wave_for_lobby(lob):
-        lob["enemies"] = {}
-        n = int(lob["enemies_per_wave"])
-        for _ in range(n):
-            eid = str(lob["next_enemy_id"]); lob["next_enemy_id"] += 1
-            etype = random.choices(["normal","fast","tank","archer"], weights=[50,30,10,10])[0]
-            side = random.choice(["top","bottom","left","right"])
-            if side == "top": x, y = random.randint(80, 1200), -40
-            elif side == "bottom": x, y = random.randint(80, 1200), 900
-            elif side == "left": x, y = -40, random.randint(80, 700)
-            else: x, y = 1400, random.randint(80, 700)
-            if etype == "normal": hp, spd = 40, 2.0
-            elif etype == "fast": hp, spd = 30, 3.0
-            elif etype == "tank": hp, spd = 80, 1.2
-            else: hp, spd = 36, 2.0
-            lob["enemies"][eid] = {"id":eid,"x":float(x),"y":float(y),"w":30,"h":30,"hp":float(hp),"etype":etype,"spd":float(spd)}
-
-    async def handler(ws):
-        pid = None
-        user_id = None
-        lobby_id = None
-        try:
-            await ws.send(json.dumps({"type": "welcome"}))
-        except Exception:
-            pass
-        try:
-            async for msg in ws:
-                try:
-                    data = json.loads(msg)
-                except Exception:
-                    continue
-
-                t = data.get("type")
-                if not isinstance(t, str):
-                    continue
-
-                # Must create or join lobby before any game/save messages
-                if t == "create_lobby":
-                    name = (data.get("name") or "").strip()[:32]
-                    password = (data.get("password") or "")[:32]
-                    if not name:
-                        await ws.send(json.dumps({"type": "lobby_error", "msg": "Lobby name required"}))
-                        continue
-                    if any(l.get("name") == name for l in lobbies.values()):
-                        await ws.send(json.dumps({"type": "lobby_error", "msg": "Name already taken"}))
-                        continue
-                    lobby_id = uuid.uuid4().hex[:12]
-                    pid = uuid.uuid4().hex[:8]
-                    lobbies[lobby_id] = {
-                        "name": name, "password": password, "connections": {ws},
-                        "players": {pid: {"x":0.0,"y":0.0,"weapon":"bow","name":"Player","active":False,"last":time.time()}},
-                        "enemies": {}, "shots": [], "chat": [],
-                        "wave": 1, "enemies_per_wave": 5, "next_enemy_id": 1,
-                    }
-                    spawn_wave_for_lobby(lobbies[lobby_id])
-                    ws_lobby[ws] = lobby_id
-                    ws_pid[ws] = pid
-                    ws_user[ws] = pid
-                    await ws.send(json.dumps({"type": "lobby_created", "lobby_id": lobby_id, "name": name}))
-                    await ws.send(json.dumps({"type": "hello", "id": pid}))
-                    await ws.send(json.dumps({"type": "chat", "messages": []}))
-                    await ws.send(json.dumps({"type": "state", "players": {pid: lobbies[lobby_id]["players"][pid]}}))
-                    await ws.send(json.dumps({"type": "enemies", "enemies": list(lobbies[lobby_id]["enemies"].values())}))
-                    await ws.send(json.dumps({"type": "shots", "shots": []}))
-                    continue
-
-                if t == "join_lobby":
-                    name = (data.get("name") or "").strip()[:32]
-                    password = (data.get("password") or "")[:32]
-                    if not name:
-                        await ws.send(json.dumps({"type": "lobby_error", "msg": "Lobby name required"}))
-                        continue
-                    found = None
-                    for lid, lob in lobbies.items():
-                        if lob["name"] == name:
-                            found = (lid, lob)
-                            break
-                    if not found:
-                        await ws.send(json.dumps({"type": "lobby_error", "msg": "Lobby not found"}))
-                        continue
-                    lid, lob = found
-                    if lob["password"] != password:
-                        await ws.send(json.dumps({"type": "lobby_error", "msg": "Wrong password"}))
-                        continue
-                    lobby_id = lid
-                    pid = uuid.uuid4().hex[:8]
-                    lob["connections"].add(ws)
-                    lob["players"][pid] = {"x":0.0,"y":0.0,"weapon":"bow","name":"Player","active":False,"last":time.time()}
-                    ws_lobby[ws] = lobby_id
-                    ws_pid[ws] = pid
-                    ws_user[ws] = pid
-                    await ws.send(json.dumps({"type": "lobby_joined", "lobby_id": lobby_id, "name": lob["name"]}))
-                    await ws.send(json.dumps({"type": "hello", "id": pid}))
-                    await ws.send(json.dumps({"type": "chat", "messages": lob["chat"][-60:]}))
-                    payload_players = {p: pl for p, pl in lob["players"].items() if pl.get("active", False)}
-                    await ws.send(json.dumps({"type": "state", "players": payload_players}))
-                    await ws.send(json.dumps({"type": "enemies", "enemies": list(lob["enemies"].values())}))
-                    await ws.send(json.dumps({"type": "shots", "shots": lob["shots"][-80:]}))
-                    continue
-
-                # From here on we must be in a lobby
-                if lobby_id is None or lobby_id not in lobbies:
-                    continue
-                lob = lobbies[lobby_id]
-                players = lob["players"]
-                enemies = lob["enemies"]
-                shots = lob["shots"]
-                chat = lob["chat"]
-
-                if t == "identify":
-                    uname = (data.get("username") or data.get("name") or "").strip()
-                    if uname:
-                        ws_user[ws] = uname[:64]
-
-                elif t == "input":
-                    p = players.get(pid)
-                    if not p:
-                        continue
-                    p["last"] = time.time()
-                    if "x" in data and "y" in data:
-                        p["x"] = float(data["x"])
-                        p["y"] = float(data["y"])
-                        p["active"] = True
-                    if "weapon" in data:
-                        p["weapon"] = str(data["weapon"])
-                    if "name" in data and str(data["name"]).strip():
-                        p["name"] = str(data["name"])[:16]
-                        if ws_user.get(ws) == pid:
-                            ws_user[ws] = str(data["name"]).strip()[:64]
-
-                elif t == "save":
-                    uid = ws_user.get(ws, pid)
-                    slot = max(1, min(3, int(data.get("slot", 1))))
-                    payload = data.get("data")
-                    if isinstance(payload, dict):
-                        try:
-                            _db_save(uid, slot, payload, "save")
-                            await ws.send(json.dumps({"type": "save_ok", "slot": slot}))
-                        except Exception as e:
-                            await ws.send(json.dumps({"type": "save_ok", "slot": slot, "error": str(e)}))
-                    else:
-                        await ws.send(json.dumps({"type": "save_ok", "slot": slot, "error": "missing data"}))
-
-                elif t == "load":
-                    uid = ws_user.get(ws, pid)
-                    slot = max(1, min(3, int(data.get("slot", 1))))
-                    try:
-                        out = _db_load(uid, slot, "save")
-                        if out is not None:
-                            await ws.send(json.dumps({"type": "load_result", "slot": slot, "data": out}))
-                        else:
-                            await ws.send(json.dumps({"type": "load_result", "slot": slot, "error": "no_save"}))
-                    except Exception as e:
-                        await ws.send(json.dumps({"type": "load_result", "slot": slot, "error": str(e)}))
-
-                elif t == "meta_get":
-                    uid = ws_user.get(ws, pid)
-                    slot = data.get("slot")
-                    try:
-                        if slot is not None:
-                            slot = max(1, min(3, int(slot)))
-                            out = _db_load(uid, slot, "meta")
-                            await ws.send(json.dumps({"type": "meta_result", "slot": slot, "data": out}))
-                        else:
-                            all_meta = _db_meta_all(uid)
-                            by_slot = {}
-                            for s in (1, 2, 3):
-                                m = all_meta.get(s)
-                                by_slot[s] = {"gems": m.get("gems", 0), "player_class": m.get("player_class", "No Class")} if m else {"gems": 0, "player_class": "No Class"}
-                            await ws.send(json.dumps({"type": "meta_result", "slots": by_slot}))
-                    except Exception as e:
-                        await ws.send(json.dumps({"type": "meta_result", "error": str(e)}))
-
-                elif t == "meta_set":
-                    uid = ws_user.get(ws, pid)
-                    slot = max(1, min(3, int(data.get("slot", 1))))
-                    payload = data.get("data")
-                    if isinstance(payload, dict):
-                        try:
-                            _db_save(uid, slot, payload, "meta")
-                            await ws.send(json.dumps({"type": "meta_ok", "slot": slot}))
-                        except Exception as e:
-                            await ws.send(json.dumps({"type": "meta_ok", "slot": slot, "error": str(e)}))
-
-                elif t == "delete_save":
-                    uid = ws_user.get(ws, pid)
-                    slot = max(1, min(3, int(data.get("slot", 1))))
-                    try:
-                        _db_delete_save(uid, slot)
-                        await ws.send(json.dumps({"type": "delete_ok", "slot": slot}))
-                    except Exception as e:
-                        await ws.send(json.dumps({"type": "delete_ok", "slot": slot, "error": str(e)}))
-
-                elif t == "shoot":
-                    p = players.get(pid)
-                    if not p or not p.get("active", False):
-                        continue
-                    sx = float(data.get("x", p["x"]))
-                    sy = float(data.get("y", p["y"]))
-                    vx = float(data.get("vx", 0))
-                    vy = float(data.get("vy", 0))
-                    shots.append({"pid": pid, "x": sx, "y": sy, "vx": vx, "vy": vy, "ts": time.time()})
-                    if len(shots) > 120:
-                        shots[:] = shots[-120:]
-
-                elif t == "hit":
-                    eid = str(data.get("enemy_id"))
-                    dmg = float(data.get("dmg", 0))
-                    if eid in enemies and dmg > 0:
-                        enemies[eid]["hp"] -= dmg
-                        if enemies[eid]["hp"] <= 0:
-                            enemies.pop(eid, None)
-                elif t == "chat":
-                    name = str(data.get("name") or players.get(pid, {}).get("name") or "Player")[:16]
-                    msg_txt = str(data.get("msg") or "").strip()[:160]
-                    if msg_txt:
-                        chat.append({"name": name, "msg": msg_txt, "ts": time.time()})
-                        if len(chat) > 60:
-                            del chat[:-60]
-                        try:
-                            websockets.broadcast(lob["connections"], json.dumps({"type": "chat", "messages": chat[-60:]}))
-                        except Exception:
-                            pass
-                # ignore unknown message types
-
-        finally:
-            try:
-                if lobby_id and lobby_id in lobbies:
-                    lob = lobbies[lobby_id]
-                    lob["connections"].discard(ws)
-                    if pid and pid in lob.get("players", {}):
-                        lob["players"].pop(pid, None)
-                    if not lob["connections"]:
-                        lobbies.pop(lobby_id, None)
-            except Exception:
-                pass
-            ws_lobby.pop(ws, None)
-            ws_pid.pop(ws, None)
-            ws_user.pop(ws, None)
-
-    async def tick_loop():
-        while True:
-            now = time.time()
-            for lobby_id, lob in list(lobbies.items()):
-                players = lob["players"]
-                enemies = lob["enemies"]
-                shots = lob["shots"]
-                chat = lob["chat"]
-                for pid in list(players.keys()):
-                    if now - float(players[pid].get("last", now)) > 15:
-                        players.pop(pid, None)
-                actives = [p for p in players.values() if p.get("active", False)]
-                if actives:
-                    for e in list(enemies.values()):
-                        ex = e["x"] + e["w"]/2
-                        ey = e["y"] + e["h"]/2
-                        best = None
-                        bestd = 1e18
-                        for p in actives:
-                            dx = float(p["x"]) - ex
-                            dy = float(p["y"]) - ey
-                            d = dx*dx + dy*dy
-                            if d < bestd:
-                                bestd = d
-                                best = p
-                        if best:
-                            dx = float(best["x"]) - ex
-                            dy = float(best["y"]) - ey
-                            dist = math.hypot(dx, dy) or 1.0
-                            spd = float(e.get("spd", 2.0))
-                            e["x"] += (dx/dist)*spd
-                            e["y"] += (dy/dist)*spd
-                if not enemies:
-                    lob["wave"] += 1
-                    lob["enemies_per_wave"] = max(1, int(round(lob["enemies_per_wave"]*1.10)))
-                    spawn_wave_for_lobby(lob)
-                payload_players = {p: pl for p, pl in players.items() if pl.get("active", False)}
-                lob["shots"] = [s for s in shots if now - s.get("ts", now) < 2.0]
-                lob["chat"] = [c for c in chat if now - float(c.get("ts", now)) < 600]
-                if lob["connections"]:
-                    try:
-                        websockets.broadcast(lob["connections"], json.dumps({"type": "state", "players": payload_players}))
-                        websockets.broadcast(lob["connections"], json.dumps({"type": "enemies", "enemies": list(lob["enemies"].values())}))
-                        websockets.broadcast(lob["connections"], json.dumps({"type": "shots", "shots": lob["shots"]}))
-                    except Exception:
-                        pass
-            await asyncio.sleep(1.0 / float(tick_hz))
-
-    try:
-        async with websockets.serve(handler, host, port, ping_interval=30, ping_timeout=10, max_size=2_000_000):
-            print(f"Infinite Archer server listening on {host}:{port}")
-            print(f"  Local:   ws://127.0.0.1:{port}")
-            print(f"  Remote:  ws://<this-machine-ip>:{port}  (e.g. DigitalOcean Droplet IP)")
-            print(f"  Clients: set IA_SERVER=ws://<server-ip>:{port} or use in-game server URL. Press Ctrl+C to stop.")
-            await tick_loop()
-    except OSError as e:
-        if "48" in str(e) or "in use" in str(e).lower() or "Address already" in str(e):
-            print(f"Port {port} already in use. Stop the other process or set PORT=8766 (or another port).")
-        else:
-            print(f"Server failed to start: {e}")
-        raise
-
-# ========== END PART 1 ==========
 
 
 
@@ -1113,9 +551,6 @@ class Ranger(PlayerClass):
         a1 = Arrow(player.centerx, player.centery, mx, my - 10, pierce=pierce_level)
         a2 = Arrow(player.centerx, player.centery, mx, my + 10, pierce=pierce_level)
         arrows.append(a1); arrows.append(a2)
-        if online_mode and net is not None:
-            net.send_shoot(player.centerx, player.centery, a1.vx, a1.vy)
-            net.send_shoot(player.centerx, player.centery, a2.vx, a2.vy)
         return True
 
 class MadScientist(PlayerClass):
@@ -1208,6 +643,16 @@ class Assassin(PlayerClass):
     def try_deflect(self, enemy_arrow):
         return False
 
+class Hacker(PlayerClass):
+    """Unlocked by achievement badge (binary 'hacker'). Terminal commands: Freeze All, Flame All, Fly Me, Invisible Me, Teleport Me."""
+    name = "Hacker"
+    color = (0, 200, 100)  # terminal green
+    def try_deflect(self, enemy_arrow):
+        return False
+
+# Hacker: achievement unlock (badge name is binary for "hacker")
+HACKER_ACHIEVEMENT_BADGE = "01101000 01100001 01100011 01101011 01100101 01110010"
+
 # Assassin hit list: 3 active bounties, refresh on timer
 ASSASSIN_BOUNTY_REFRESH_MS = 120000  # 2 min
 ASSASSIN_BOUNTY_POOL = [
@@ -1237,6 +682,7 @@ PLAYER_CLASS_ORDER = [
     Knight,
     Vampire,
     Assassin,
+    Hacker,
     MadScientist,
     Robber,
 ]
@@ -1250,6 +696,7 @@ CLASS_COSTS = {
     "Knight": 2000,
     "Vampire": 4000,
     "Assassin": 5500,
+    "Hacker": None,  # unlocked by achievement only
     "Mad Scientist": 10000,
     "Robber": 15000,
 }
@@ -1257,9 +704,25 @@ CLASS_COSTS = {
 ROBBER_GEM_COST = 15000
 ROBBER_MIN_GEMS_TO_SHOW = 15000
 
+# Achievements: badge name -> unlock (e.g. Hacker class). Persisted in meta.
+earned_achievements = set()
+
+def has_achievement(badge_name):
+    return badge_name in earned_achievements
+
+def grant_achievement(badge_name):
+    global earned_achievements, owned_classes
+    if badge_name in earned_achievements:
+        return
+    earned_achievements.add(badge_name)
+    if badge_name == HACKER_ACHIEVEMENT_BADGE:
+        owned_classes.add("Hacker")
+
 def class_rarity_label(cls_name):
     if cls_name == "Robber":
         return "Secret"
+    if cls_name == "Hacker":
+        return "Achievement"
     if cls_name == "Mad Scientist":
         return "Advanced"
     if cls_name in ("Knight", "Ranger", "Vampire", "Assassin"):
@@ -1290,9 +753,11 @@ flame_mastery_unlocked = False
 flame_bomb_ball = None   # {"x", "y", "vx", "vy"} or None
 flame_bomb_zone = None   # {"cx", "cy", "ttl_ms", "radius", "last_burn_tick_ms"} or None
 FLAME_BOMB_BALL_SPEED = 14
-FLAME_BOMB_ZONE_RADIUS = 85
+FLAME_BOMB_ZONE_RADIUS = 170   # 2x original (85); zone is 2x bigger
 FLAME_BOMB_ZONE_DURATION_MS = 8000
-FLAME_BOMB_ZONE_BURN_MS = 4000
+FLAME_BOMB_ZONE_BURN_MS = 5000   # match flamethrower burn duration
+FLAME_BOMB_ZONE_TICK_MS = 100    # same as flamethrower: damage + refresh burn every 100ms
+FLAME_BOMB_ZONE_DMG_PER_TICK = 0.2   # fraction of arrow_damage per tick (same as flamethrower)
 
 # Overdraw (Epic): first arrow hit each wave gets +50% damage
 first_arrow_hit_this_wave = False
@@ -1317,11 +782,12 @@ ROBBER_SHOTGUN_PELLETS = 5
 ROBBER_SHOTGUN_MAGAZINE = 5
 ROBBER_SHOTGUN_FIRE_INTERVAL_MS = 500   # 0.5 s between shots
 ROBBER_SHOTGUN_RELOAD_MS = 2500         # 2.5 s reload after 5 shots
-ROBBER_FLAME_TICK_MS = 100
-ROBBER_FLAME_BURN_MS = 5000
-ROBBER_FLAME_CONE_RANGE = 350           # taller/longer cone
-ROBBER_FLAME_CONE_ANGLE_RAD = math.radians(60)   # narrower cone
-ROBBER_FLAME_DMG_PER_TICK = 0.2   # fraction of arrow_damage per tick
+# Flamethrower: Flame Archer mastery only (was on Robber)
+FLAME_THROWER_TICK_MS = 100
+FLAME_THROWER_BURN_MS = 5000
+FLAME_THROWER_CONE_RANGE = 350
+FLAME_THROWER_CONE_ANGLE_RAD = math.radians(60)
+FLAME_THROWER_DMG_PER_TICK = 0.2   # fraction of arrow_damage per tick
 ROBBER_SNIPER_INTERVAL_MS = 3142  # 3.141592653s
 ROBBER_SNIPER_DAMAGE_MULT = 6.0
 last_robber_ak_ms = 0
@@ -1330,11 +796,128 @@ minigun_firing_until_ms = 0
 minigun_overheat_until_ms = 0
 minigun_last_bullet_ms = 0
 last_robber_sniper_ms = 0
-last_robber_flame_tick_ms = 0
-robber_flame_active = False  # True while flamethrower is firing (for drawing cone)
+last_flame_archer_flame_tick_ms = 0   # Flame Archer mastery: flamethrower in slot 3
+flame_archer_flame_active = False
+flame_archer_weapon = "bow"   # "bow" (slot 1) or "flamethrower" (slot 3)
 shotgun_shots_left = 5
 last_shotgun_shot_ms = 0
 shotgun_reload_until_ms = 0
+
+# Normal Archer (No Class): R = dash (direction of movement or facing), 15s cooldown
+archer_dash_until_ms = 0
+archer_dash_cooldown_until_ms = 0
+archer_dash_vx = 0.0
+archer_dash_vy = 0.0
+ARCHER_DASH_DURATION_MS = 180
+ARCHER_DASH_COOLDOWN_MS = 15000
+ARCHER_DASH_SPEED = 22
+
+# Hacker: terminal commands (cooldowns and active effects)
+hacker_fly_until_ms = 0
+hacker_fly_cooldown_until_ms = 0
+hacker_invis_until_ms = 0
+hacker_invis_cooldown_until_ms = 0
+hacker_freeze_cooldown_until_ms = 0
+hacker_flame_cooldown_until_ms = 0
+hacker_teleport_cooldown_until_ms = 0
+hacker_teleport_pending = False
+HACKER_FLY_DURATION_MS = 3500
+HACKER_FLY_COOLDOWN_MS = 28000
+HACKER_INVIS_DURATION_MS = 4500
+HACKER_INVIS_COOLDOWN_MS = 30000
+HACKER_FREEZE_DURATION_MS = 4000
+HACKER_FREEZE_COOLDOWN_MS = 25000
+HACKER_FLAME_BURN_MS = 3500
+HACKER_FLAME_COOLDOWN_MS = 22000
+HACKER_TELEPORT_COOLDOWN_MS = 24000
+
+HACKER_TERMINAL_HEIGHT = 56
+# All-black hacker/terminal theme
+HACKER_TERMINAL_COLOR = (0, 0, 0)
+HACKER_TERMINAL_BORDER = (0, 255, 100)
+HACKER_TEXT_READY = (0, 255, 100)
+HACKER_TEXT_COOLDOWN = (80, 120, 80)
+HACKER_BUTTON_BG = (0, 0, 0)
+HACKER_BUTTON_BORDER_READY = (0, 200, 80)
+HACKER_BUTTON_BORDER_CD = (40, 60, 40)
+
+def get_hacker_terminal_layout():
+    """Returns (bar_rect, [(btn_rect, command_key), ...]). Bar at bottom; 5 equal-width buttons."""
+    bar = pygame.Rect(0, HEIGHT - HACKER_TERMINAL_HEIGHT, WIDTH, HACKER_TERMINAL_HEIGHT)
+    pad = 8
+    n = 5
+    total_w = WIDTH - 2 * pad
+    btn_w = max(80, (total_w - (n - 1) * pad) // n)
+    btn_h = HACKER_TERMINAL_HEIGHT - 2 * pad
+    y = bar.y + pad
+    commands = [("freeze", "Freeze All"), ("flame", "Flame All"), ("fly", "Fly Me"), ("invis", "Invisible Me"), ("teleport", "Teleport Me")]
+    buttons = []
+    x = pad
+    for cmd_key, _ in commands:
+        buttons.append((pygame.Rect(x, y, btn_w, btn_h), cmd_key))
+        x += btn_w + pad
+    return bar, buttons
+
+def draw_hacker_terminal(surf, now_ms):
+    """Draw terminal bar and 5 command buttons with cooldown state. All-black hacker theme."""
+    bar, buttons = get_hacker_terminal_layout()
+    pygame.draw.rect(surf, HACKER_TERMINAL_COLOR, bar)
+    pygame.draw.rect(surf, HACKER_TERMINAL_BORDER, bar, 2)
+    title = FONT_XS.render("> terminal -- [hacker@infinite-archer]$", True, HACKER_TEXT_READY)
+    surf.blit(title, (bar.x + 10, bar.y + (bar.h - title.get_height()) // 2))
+    cooldowns = {
+        "freeze": hacker_freeze_cooldown_until_ms,
+        "flame": hacker_flame_cooldown_until_ms,
+        "fly": hacker_fly_cooldown_until_ms,
+        "invis": hacker_invis_cooldown_until_ms,
+        "teleport": hacker_teleport_cooldown_until_ms,
+    }
+    labels = {"freeze": "Freeze All", "flame": "Flame All", "fly": "Fly Me", "invis": "Invisible Me", "teleport": "Teleport Me"}
+    for (rect, cmd) in buttons:
+        on_cd = now_ms < cooldowns.get(cmd, 0)
+        pygame.draw.rect(surf, HACKER_BUTTON_BG, rect)
+        pygame.draw.rect(surf, HACKER_BUTTON_BORDER_CD if on_cd else HACKER_BUTTON_BORDER_READY, rect, 1)
+        label = labels.get(cmd, cmd)
+        if on_cd:
+            sec = (cooldowns[cmd] - now_ms) // 1000
+            label = f"{sec}s"
+        txt_color = HACKER_TEXT_COOLDOWN if on_cd else HACKER_TEXT_READY
+        txt = FONT_XS.render(label[:12], True, txt_color)
+        surf.blit(txt, (rect.x + (rect.w - txt.get_width()) // 2, rect.y + (rect.h - txt.get_height()) // 2))
+
+def trigger_hacker_command(cmd, now_ms):
+    """Execute one Hacker terminal command. Returns True if triggered."""
+    global hacker_fly_until_ms, hacker_fly_cooldown_until_ms, hacker_invis_until_ms, hacker_invis_cooldown_until_ms
+    global hacker_freeze_cooldown_until_ms, hacker_flame_cooldown_until_ms, hacker_teleport_cooldown_until_ms, hacker_teleport_pending
+    if cmd == "fly" and now_ms >= hacker_fly_cooldown_until_ms:
+        hacker_fly_until_ms = now_ms + HACKER_FLY_DURATION_MS
+        hacker_fly_cooldown_until_ms = now_ms + HACKER_FLY_COOLDOWN_MS
+        floating_texts.append({"x": player.centerx, "y": player.centery - 30, "txt": "Fly Me!", "color": CYAN, "ttl": 800, "vy": -0.5, "alpha": 255})
+        return True
+    if cmd == "invis" and now_ms >= hacker_invis_cooldown_until_ms:
+        hacker_invis_until_ms = now_ms + HACKER_INVIS_DURATION_MS
+        hacker_invis_cooldown_until_ms = now_ms + HACKER_INVIS_COOLDOWN_MS
+        floating_texts.append({"x": player.centerx, "y": player.centery - 30, "txt": "Invisible Me!", "color": PURPLE, "ttl": 800, "vy": -0.5, "alpha": 255})
+        return True
+    if cmd == "freeze" and now_ms >= hacker_freeze_cooldown_until_ms:
+        hacker_freeze_cooldown_until_ms = now_ms + HACKER_FREEZE_COOLDOWN_MS
+        for e in enemies:
+            e.slow_until_ms = now_ms + HACKER_FREEZE_DURATION_MS
+        floating_texts.append({"x": player.centerx, "y": player.centery - 30, "txt": "Freeze All!", "color": (100, 200, 255), "ttl": 800, "vy": -0.5, "alpha": 255})
+        return True
+    if cmd == "flame" and now_ms >= hacker_flame_cooldown_until_ms:
+        hacker_flame_cooldown_until_ms = now_ms + HACKER_FLAME_COOLDOWN_MS
+        for e in enemies:
+            e.burn_ms_left = max(getattr(e, "burn_ms_left", 0), HACKER_FLAME_BURN_MS)
+            e.last_status_tick = 0
+        floating_texts.append({"x": player.centerx, "y": player.centery - 30, "txt": "Flame All!", "color": ORANGE, "ttl": 800, "vy": -0.5, "alpha": 255})
+        return True
+    if cmd == "teleport" and now_ms >= hacker_teleport_cooldown_until_ms:
+        hacker_teleport_cooldown_until_ms = now_ms + HACKER_TELEPORT_COOLDOWN_MS
+        hacker_teleport_pending = True
+        floating_texts.append({"x": player.centerx, "y": player.centery - 30, "txt": "Click to teleport!", "color": (150, 255, 150), "ttl": 1200, "vy": -0.5, "alpha": 255})
+        return True
+    return False
 
 # ---------- CHAT (client + offline) ----------
 chat_open = False
@@ -1557,10 +1140,8 @@ slot_meta_cache = {1: {"gems":0,"player_class":"No Class"},
                    3: {"gems":0,"player_class":"No Class"}}
 
 def load_slot_meta(slot):
-    """Read meta for menu display. When online, use cache (filled by refresh_all_slot_meta)."""
+    """Read meta for menu display."""
     slot = int(slot)
-    if online_mode and net is not None and net.connected:
-        return slot_meta_cache.get(slot, {"gems": 0, "player_class": "No Class"})
     path = get_meta_path(slot)
     if not os.path.exists(path):
         # Fallback: read from run save file if no meta file yet
@@ -1587,16 +1168,6 @@ def load_slot_meta(slot):
         return slot_meta_cache[slot]
 
 def refresh_all_slot_meta():
-    if online_mode and net is not None and net.connected:
-        net.send_meta_get(None)
-        for _ in range(100):  # ~5 sec at 20 fps
-            pygame.event.pump()
-            r = net.get_meta_result()  # full slots response, no slot filter
-            if r is not None and r.get("slots"):
-                for s, m in r["slots"].items():
-                    slot_meta_cache[int(s)] = {"gems": int(m.get("gems", 0)), "player_class": str(m.get("player_class", "No Class"))}
-                return
-            clock.tick(20)
     for s in (1, 2, 3):
         load_slot_meta(s)
 
@@ -1638,53 +1209,23 @@ def confirm_popup(message, yes_text="Yes", no_text="No"):
         clock.tick(FPS)
 
 def delete_save_slot(slot):
-    """Delete save and meta for the given slot (1–3). When online, tell server."""
+    """Delete save and meta for the given slot (1–3)."""
     global slot_meta_cache
     s = max(1, min(3, int(slot)))
-    if online_mode and net is not None and net.connected:
-        net.send_delete_save(s)
-    else:
-        save_path = get_save_path(s)
-        meta_path = get_meta_path(s)
-        for path in (save_path, meta_path):
-            if os.path.isfile(path):
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
+    save_path = get_save_path(s)
+    meta_path = get_meta_path(s)
+    for path in (save_path, meta_path):
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
     slot_meta_cache[s] = {"gems": 0, "player_class": "No Class"}
     refresh_all_slot_meta()
 
 def load_meta_into_game():
-    """Load gems, owned_classes, player_class from current slot (file or server when online)."""
-    global gems, owned_classes, player_class
-    if online_mode and net is not None and net.connected:
-        net.send_meta_get(current_save_slot)
-        for _ in range(100):  # ~5 sec at 20 fps
-            pygame.event.pump()
-            r = net.get_meta_result(expected_slot=current_save_slot)
-            if r is not None and r.get("data"):
-                data = r["data"]
-                gems = int(data.get("gems", 0))
-                raw = data.get("owned_classes", [])
-                owned_classes.clear()
-                if isinstance(raw, list):
-                    for c in raw:
-                        if isinstance(c, str) and c.strip():
-                            owned_classes.add(c.strip())
-                if not owned_classes:
-                    owned_classes.add("No Class")
-                class_name = str(data.get("player_class", "No Class"))
-                if class_name not in owned_classes:
-                    owned_classes.add(class_name)
-                for cls in PLAYER_CLASS_ORDER:
-                    if cls.name == class_name:
-                        player_class = cls()
-                        return
-                player_class = NoClass()
-                return
-            clock.tick(20)
-        return
+    """Load gems, owned_classes, player_class, earned_achievements from current slot."""
+    global gems, owned_classes, player_class, earned_achievements
     path = get_meta_path()
     if not os.path.exists(path):
         return
@@ -1692,6 +1233,8 @@ def load_meta_into_game():
         with open(path, "r") as f:
             data = json.load(f)
         gems = int(data.get("gems", 0))
+        raw_ach = data.get("earned_achievements", [])
+        earned_achievements = set(x for x in raw_ach if isinstance(x, str))
         raw = data.get("owned_classes", [])
         owned_classes.clear()
         if isinstance(raw, list):
@@ -1712,10 +1255,10 @@ def load_meta_into_game():
         pass
 
 def save_meta():
-    """Write current slot's meta (gems, owned_classes, player_class). When online, send to server."""
+    """Write current slot's meta (gems, owned_classes, player_class)."""
     try:
         existing_classes = set()
-        if not (online_mode and net is not None and net.connected) and os.path.exists(get_meta_path()):
+        if os.path.exists(get_meta_path()):
             try:
                 with open(get_meta_path(), "r") as f:
                     existing = json.load(f)
@@ -1726,11 +1269,7 @@ def save_meta():
                 pass
         merged = existing_classes | (owned_classes if owned_classes else {player_class.name})
         classes_to_save = list(merged)
-        data = {"gems": gems, "owned_classes": classes_to_save, "player_class": player_class.name}
-        if online_mode and net is not None and net.connected:
-            net.send_meta_set(current_save_slot, data)
-            slot_meta_cache[current_save_slot] = {"gems": gems, "player_class": player_class.name}
-            return
+        data = {"gems": gems, "owned_classes": classes_to_save, "player_class": player_class.name, "earned_achievements": list(earned_achievements)}
         with open(get_meta_path(), "w") as f:
             json.dump(data, f)
         load_slot_meta(current_save_slot)
@@ -1768,11 +1307,8 @@ def save_game():
             "flame_mastery_kills_dot_final": flame_mastery_kills_dot_final,
             "flame_mastery_bosses_burning": flame_mastery_bosses_burning,
             "flame_mastery_unlocked": flame_mastery_unlocked,
+            "earned_achievements": list(earned_achievements),
         }
-        if online_mode and net is not None and net.connected:
-            net.send_save(current_save_slot, data)
-            save_meta()
-            return
         with open(get_save_path(), "w") as f:
             json.dump(data, f)
         save_meta()
@@ -1782,33 +1318,19 @@ def save_game():
 def load_game():
     global player_hp, max_hp, arrow_damage, player_exp, player_level, exp_required
     global wave, score, gems, pierce_level, knockback_level, owned_abilities, owned_classes, corrosive_level
-    global enemies_per_wave, player_class
+    global enemies_per_wave, player_class, earned_achievements
     global vampire_fly_until_ms, vampire_fly_cooldown_until_ms
     global assassin_invis_until_ms, assassin_invis_cooldown_until_ms
     global assassin_kills, assassin_completed_bounties, assassin_active_bounties, assassin_bounty_refresh_at_ms
     global flame_mastery_kills_burning, flame_mastery_kills_dot_final, flame_mastery_bosses_burning, flame_mastery_unlocked
 
-    if online_mode and net is not None and net.connected:
-        net.send_load(current_save_slot)
-        for _ in range(100):  # ~5 sec at 20 fps
-            pygame.event.pump()
-            r = net.get_load_result(expected_slot=current_save_slot)
-            if r is not None:
-                if r.get("error") == "no_save" or r.get("data") is None:
-                    return False
-                data = r["data"]
-                break
-            clock.tick(20)
-        else:
-            return False
-    else:
-        if not os.path.exists(get_save_path()):
-            return False
-        try:
-            with open(get_save_path(), "r") as f:
-                data = json.load(f)
-        except Exception:
-            return False
+    if not os.path.exists(get_save_path()):
+        return False
+    try:
+        with open(get_save_path(), "r") as f:
+            data = json.load(f)
+    except Exception:
+        return False
 
     try:
         px, py, w, h = data.get("player", [WIDTH//2, HEIGHT//2, 40, 40])
@@ -1846,6 +1368,8 @@ def load_game():
             owned_classes.add("No Class")
         if class_name not in owned_classes:
             owned_classes.add(class_name)
+        raw_ach = data.get("earned_achievements", [])
+        earned_achievements = set(x for x in raw_ach if isinstance(x, str))
         found = False
         for cls in PLAYER_CLASS_ORDER:
             if cls.name == class_name:
@@ -1863,6 +1387,16 @@ def load_game():
         vampire_fly_cooldown_until_ms = 0
         assassin_invis_until_ms = 0
         assassin_invis_cooldown_until_ms = 0
+        globals()["archer_dash_until_ms"] = 0
+        globals()["archer_dash_cooldown_until_ms"] = 0
+        globals()["hacker_fly_until_ms"] = 0
+        globals()["hacker_fly_cooldown_until_ms"] = 0
+        globals()["hacker_invis_until_ms"] = 0
+        globals()["hacker_invis_cooldown_until_ms"] = 0
+        globals()["hacker_freeze_cooldown_until_ms"] = 0
+        globals()["hacker_flame_cooldown_until_ms"] = 0
+        globals()["hacker_teleport_cooldown_until_ms"] = 0
+        globals()["hacker_teleport_pending"] = False
         globals()["mad_scientist_overcharge_until_ms"] = 0
         globals()["mad_scientist_overcharge_cooldown_until_ms"] = 0
         assassin_kills = dict(data.get("assassin_kills", {"normal": 0, "fast": 0, "tank": 0, "archer": 0, "boss": 0}))
@@ -1971,7 +1505,6 @@ def reset_game():
     global corrosive_level
     global player_class
     global owned_classes
-    global net, online_mode
     global vampire_fly_until_ms, vampire_fly_cooldown_until_ms
     global assassin_invis_until_ms, assassin_invis_cooldown_until_ms
     global assassin_kills, assassin_completed_bounties, assassin_active_bounties, assassin_bounty_refresh_at_ms
@@ -2027,7 +1560,9 @@ def reset_game():
     globals()["minigun_overheat_until_ms"] = 0
     globals()["minigun_last_bullet_ms"] = 0
     globals()["last_robber_sniper_ms"] = 0
-    globals()["last_robber_flame_tick_ms"] = 0
+    globals()["last_flame_archer_flame_tick_ms"] = 0
+    globals()["flame_archer_flame_active"] = False
+    globals()["flame_archer_weapon"] = "bow"
     globals()["shotgun_shots_left"] = ROBBER_SHOTGUN_MAGAZINE
     globals()["last_shotgun_shot_ms"] = 0
     globals()["shotgun_reload_until_ms"] = 0
@@ -2060,6 +1595,18 @@ def reset_game():
     vampire_fly_cooldown_until_ms = 0
     assassin_invis_until_ms = 0
     assassin_invis_cooldown_until_ms = 0
+    archer_dash_until_ms = 0
+    archer_dash_cooldown_until_ms = 0
+    globals()["archer_dash_vx"] = 0.0
+    globals()["archer_dash_vy"] = 0.0
+    globals()["hacker_fly_until_ms"] = 0
+    globals()["hacker_fly_cooldown_until_ms"] = 0
+    globals()["hacker_invis_until_ms"] = 0
+    globals()["hacker_invis_cooldown_until_ms"] = 0
+    globals()["hacker_freeze_cooldown_until_ms"] = 0
+    globals()["hacker_flame_cooldown_until_ms"] = 0
+    globals()["hacker_teleport_cooldown_until_ms"] = 0
+    globals()["hacker_teleport_pending"] = False
     mad_scientist_overcharge_until_ms = 0
     mad_scientist_overcharge_cooldown_until_ms = 0
     assassin_kills = {"normal": 0, "fast": 0, "tank": 0, "archer": 0, "boss": 0}
@@ -2067,18 +1614,7 @@ def reset_game():
     assassin_active_bounties = []
     assassin_bounty_refresh_at_ms = 0
 
-    # online
-    if (not ONLINE_ENABLED) and online_mode:
-        online_mode = False
-
-    if ONLINE_ENABLED and online_mode and websockets is not None:
-        url = os.environ.get("IA_SERVER", "ws://127.0.0.1:8765")
-        net = NetClient(url)
-        net.start()
-    else:
-        net = None
-
-# ---------- Spawning (offline) ----------
+# ---------- Spawning ----------
 def spawn_wave_at_positions(positions):
     enemies.clear()
     for pos in positions:
@@ -2090,26 +1626,92 @@ def spawn_wave(count):
     spawn_wave_at_positions(spawn_pattern_positions[:int(count)])
 
 def spawn_boss():
-    rect = pygame.Rect(WIDTH//2 - 60, -140, 120, 120)
+    # Larger, much tougher boss
+    size = 140
+    rect = pygame.Rect(WIDTH//2 - size//2, -size - 40, size, size)
     boss = Enemy(rect, "tank", is_mini=False, hp_override=DEFAULTS["boss_hp"])
     boss.is_boss = True
     boss.max_hp = DEFAULTS["boss_hp"]
-    boss.color = (100, 10, 60)
-    boss.speed = 1.4
-    boss.damage = DEFAULTS["archer_shot_damage"] * 6
-    boss.summon_timer = pygame.time.get_ticks() + 4000
+    boss.color = (120, 0, 50)
+    boss.speed = 1.9
+    boss.damage = DEFAULTS["archer_shot_damage"] * 12
+    now = pygame.time.get_ticks()
+    boss.summon_timer = now + 3500
+    boss.summon_interval = 3500
+    boss.boss_shoot_timer = now + 3000
+    boss.boss_shoot_interval = 4200
+    boss.slam_timer = now + 4500
+    boss.slam_interval = 6200
+    boss.charge_timer = now + 5000
+    boss.charge_interval = 7500
+    boss.charge_until_ms = 0
+    boss.charge_speed = 11
     enemies.append(boss)
+
+def boss_try_shoot(boss_enemy):
+    """Boss fires a heavy projectile at the player."""
+    now = pygame.time.get_ticks()
+    interval = getattr(boss_enemy, "boss_shoot_interval", 3200)
+    if getattr(boss_enemy, "boss_shoot_timer", 0) and now >= boss_enemy.boss_shoot_timer:
+        dx = player.centerx - boss_enemy.rect.centerx
+        dy = player.centery - boss_enemy.rect.centery
+        d = math.hypot(dx, dy) or 1
+        speed = 7
+        vx, vy = speed * dx / d, speed * dy / d
+        proj = pygame.Rect(boss_enemy.rect.centerx - 6, boss_enemy.rect.centery - 6, 12, 12)
+        dmg = getattr(boss_enemy, "damage", DEFAULTS["archer_shot_damage"] * 10)
+        enemy_arrows.append(EnemyArrow(proj, vx, vy, max(10, dmg // 4)))
+        boss_enemy.boss_shoot_timer = now + interval
+
+def boss_try_slam(boss_enemy, assassin_invis=False):
+    """Boss slams ground; damages player if in range (not while Assassin invisible)."""
+    now = pygame.time.get_ticks()
+    interval = getattr(boss_enemy, "slam_interval", 5000)
+    if getattr(boss_enemy, "slam_timer", 0) and now >= boss_enemy.slam_timer:
+        boss_enemy.slam_timer = now + interval
+        dist = math.hypot(player.centerx - boss_enemy.rect.centerx, player.centery - boss_enemy.rect.centery)
+        slam_range = 160
+        if dist <= slam_range and not assassin_invis:
+            global player_hp
+            dmg = max(8, getattr(boss_enemy, "damage", 40) // 3)
+            if not admin_god_mode:
+                player_hp -= dmg
+            floating_texts.append({"x": player.centerx, "y": player.centery - 30, "txt": "SLAM!", "color": ORANGE, "ttl": 1200, "vy": -0.8, "alpha": 255})
+            floating_texts.append({"x": player.centerx, "y": player.centery - 50, "txt": f"-{dmg}", "color": RED, "ttl": 1000, "vy": -0.6, "alpha": 255})
+
+def boss_try_charge(boss_enemy):
+    """Boss starts a charge dash toward the player (handled in game loop for movement)."""
+    now = pygame.time.get_ticks()
+    if getattr(boss_enemy, "charge_until_ms", 0) and now < boss_enemy.charge_until_ms:
+        return
+    interval = getattr(boss_enemy, "charge_interval", 6000)
+    if getattr(boss_enemy, "charge_timer", 0) and now >= boss_enemy.charge_timer:
+        boss_enemy.charge_timer = now + interval
+        boss_enemy.charge_until_ms = now + 450
+
+def boss_update_charge(boss_enemy, now_ms):
+    """Move boss during charge; return True if charging this frame."""
+    if not getattr(boss_enemy, "charge_until_ms", 0) or now_ms >= boss_enemy.charge_until_ms:
+        return False
+    dx = player.centerx - boss_enemy.rect.centerx
+    dy = player.centery - boss_enemy.rect.centery
+    dist = math.hypot(dx, dy) or 1
+    spd = getattr(boss_enemy, "charge_speed", 14)
+    boss_enemy.rect.x += int(spd * dx / dist)
+    boss_enemy.rect.y += int(spd * dy / dist)
+    return True
 
 def boss_try_summon(boss_enemy):
     now = pygame.time.get_ticks()
+    interval = getattr(boss_enemy, "summon_interval", 4000)
     if getattr(boss_enemy, "summon_timer", 0) and now >= boss_enemy.summon_timer:
-        n = random.randint(4, 7)
+        n = random.randint(5, 8)
         for _ in range(n):
-            rx = boss_enemy.rect.centerx + random.randint(-100, 100)
-            ry = boss_enemy.rect.centery + random.randint(-100, 100)
+            rx = boss_enemy.rect.centerx + random.randint(-120, 120)
+            ry = boss_enemy.rect.centery + random.randint(-120, 120)
             rect = pygame.Rect(rx, ry, 20, 20)
             enemies.append(Enemy(rect, "fast", is_mini=True))
-        boss_enemy.summon_timer = now + 4000
+        boss_enemy.summon_timer = now + interval
 
 def draw_boss_bar(boss):
     """Draw a boss HP bar at top center when a boss is alive."""
@@ -2146,13 +1748,16 @@ def draw_exp_bar():
     w = WIDTH - margin * 2
     h = 18
     x = margin
-    y = HEIGHT - h - 12
+    if isinstance(player_class, Hacker):
+        y = HEIGHT - HACKER_TERMINAL_HEIGHT - h - 24
+    else:
+        y = HEIGHT - h - 12
     pygame.draw.rect(screen, (50, 52, 56), (x, y, w, h))
     frac = min(1.0, player_exp / exp_required) if exp_required > 0 else 0.0
     pygame.draw.rect(screen, BLUE, (x, y, int(w * frac), h))
     pygame.draw.rect(screen, UI_BORDER, (x, y, w, h), 3)
     lvl_txt = FONT_SM.render(f"Level: {player_level}  EXP: {player_exp}/{exp_required}", True, UI_TEXT)
-    screen.blit(lvl_txt, (x + 6, y - 24))
+    screen.blit(lvl_txt, (x + 6, y - 22))
 
 def notify_once(msg, duration=900):
     start = pygame.time.get_ticks()
@@ -2609,10 +2214,6 @@ def shoot_bow(mx, my):
     # Class hook
     try:
         if player_class.on_arrow_fire(mx, my):
-            # if online, still send the arrow event (use last created arrow velocity)
-            if online_mode and net is not None and arrows:
-                a = arrows[-1]
-                net.send_shoot(player.centerx, player.centery, a.vx, a.vy)
             return
     except:
         pass
@@ -2623,14 +2224,9 @@ def shoot_bow(mx, my):
         a1 = Arrow(player.centerx, player.centery, mx, my - 10, pierce=pierce_level)
         a2 = Arrow(player.centerx, player.centery, mx, my + 10, pierce=pierce_level)
         arrows.append(a1); arrows.append(a2)
-        if online_mode and net is not None:
-            net.send_shoot(player.centerx, player.centery, a1.vx, a1.vy)
-            net.send_shoot(player.centerx, player.centery, a2.vx, a2.vy)
     else:
         a = Arrow(player.centerx, player.centery, mx, my, pierce=pierce_level)
         arrows.append(a)
-        if online_mode and net is not None:
-            net.send_shoot(player.centerx, player.centery, a.vx, a.vy)
 
 def spawn_robber_bullet(mx, my, damage_mult=1.0, spread_deg=0):
     """Spawn one bullet (Arrow with damage_override) for Robber guns."""
@@ -2648,11 +2244,10 @@ def spawn_robber_bullet(mx, my, damage_mult=1.0, spread_deg=0):
     arrows.append(a)
 
 def update_robber_guns(now_ms, mx, my, mouse_held, clicked):
-    """Handle Robber gun firing: AK (hold), minigun (charge then auto), shotgun (5 shots, 0.5s rate, 2.5s reload), flamethrower (hold), sniper (slow)."""
+    """Handle Robber gun firing: AK (hold), minigun (charge then auto), shotgun (5 shots, 0.5s rate, 2.5s reload), sniper (slow)."""
     global last_robber_ak_ms, minigun_charge_start_ms, minigun_firing_until_ms, minigun_overheat_until_ms, minigun_last_bullet_ms
-    global last_robber_sniper_ms, last_robber_flame_tick_ms, score, robber_flame_active
+    global last_robber_sniper_ms, score
     global shotgun_shots_left, last_shotgun_shot_ms, shotgun_reload_until_ms
-    robber_flame_active = False
     gun = robbers_gun
     # Shotgun: when reload finishes, refill magazine
     if shotgun_reload_until_ms and now_ms >= shotgun_reload_until_ms:
@@ -2703,34 +2298,6 @@ def update_robber_guns(now_ms, mx, my, mouse_held, clicked):
             if shotgun_shots_left == 0:
                 shotgun_reload_until_ms = now_ms + ROBBER_SHOTGUN_RELOAD_MS
         return
-    # --- Flamethrower: AOE cone + 5s burn (tick every 100ms while held) ---
-    if gun == "flamethrower":
-        robber_flame_active = mouse_held
-        if mouse_held and now_ms - last_robber_flame_tick_ms >= ROBBER_FLAME_TICK_MS:
-            last_robber_flame_tick_ms = now_ms
-            ang = math.atan2(my - player.centery, mx - player.centerx)
-            half = ROBBER_FLAME_CONE_ANGLE_RAD / 2
-            dmg = max(1, int(arrow_damage * ROBBER_FLAME_DMG_PER_TICK))
-            for enemy in enemies[:]:
-                ex = enemy.rect.centerx - player.centerx
-                ey = enemy.rect.centery - player.centery
-                dist = math.hypot(ex, ey)
-                if dist > ROBBER_FLAME_CONE_RANGE:
-                    continue
-                eang = math.atan2(ey, ex)
-                diff = abs((eang - ang + math.pi) % (2 * math.pi) - math.pi)
-                if diff <= half:
-                    enemy.hp -= dmg
-                    enemy.burn_ms_left = ROBBER_FLAME_BURN_MS
-                    enemy.last_status_tick = now_ms - 1000
-                    floating_texts.append({"x": enemy.rect.centerx, "y": enemy.rect.top - 12, "txt": f"-{dmg}", "color": ORANGE, "ttl": 800, "vy": -0.5, "alpha": 255})
-                    if enemy.hp <= 0:
-                        record_assassin_kill(enemy)
-                        score += 1
-                        spawn_orb(enemy.rect.centerx, enemy.rect.centery, amount=1)
-                        try: enemies.remove(enemy)
-                        except: pass
-        return
     # --- Sniper: 1 shot every 3.14s, 6x damage ---
     if gun == "sniper":
         if (clicked or mouse_held) and now_ms - last_robber_sniper_ms >= ROBBER_SNIPER_INTERVAL_MS:
@@ -2750,6 +2317,7 @@ CLASS_SHORT_DESC = {
     "Knight": "Deflect + armor",
     "Vampire": "Life steal + fly (V)",
     "Assassin": "Invis + backstab knife (V)",
+    "Hacker": "Terminal commands (achievement unlock)",
     "Mad Scientist": "Homing + splash, V: Overcharge",
     "Robber": "5 guns (1–5), replaces bow",
 }
@@ -5321,7 +4889,7 @@ def flame_archer_mastery_panel():
         # Right: rewards then quest list
         rew_y = pic_y + 8
         screen.blit(FONT_SM.render("Rewards:", True, (255, 200, 80)), (right_x, rew_y))
-        rewards = ["Flame duration x2", "Flame Bomb (F)", "1.5x speed & damage in zone"]
+        rewards = ["Flame duration x2", "Flame Bomb (F)", "Flamethrower (slot 3)", "1.5x speed & damage in zone"]
         for i, r in enumerate(rewards):
             screen.blit(FONT_SM.render(r, True, (255, 200, 100)), (right_x, rew_y + 24 + i * 22))
         quest_y = rew_y + 24 + len(rewards) * 22 + 16
@@ -5353,12 +4921,15 @@ def flame_archer_mastery_panel():
 def class_shop_menu():
     global gems, player_class, owned_classes
     show_robber = False  # becomes True when player clicks on Gems (if gems >= 15000)
-    # Build list of classes to show (Robber only if show_robber and gems >= ROBBER_MIN_GEMS_TO_SHOW)
+    # Build list of classes to show (Robber only if revealed; Hacker only if achievement earned)
     def visible_classes():
         out = []
         for cls in PLAYER_CLASS_ORDER:
             if cls.name == "Robber":
                 if show_robber and gems >= ROBBER_MIN_GEMS_TO_SHOW:
+                    out.append(cls)
+            elif cls.name == "Hacker":
+                if has_achievement(HACKER_ACHIEVEMENT_BADGE):
                     out.append(cls)
             else:
                 out.append(cls)
@@ -5391,7 +4962,7 @@ def class_shop_menu():
         for i, cls in enumerate(vis):
             y = y_start + i * row_h
             rect = pygame.Rect(WIDTH//2 - max_w//2, y, max_w, btn_h)
-            cost = CLASS_COSTS[cls.name]
+            cost = CLASS_COSTS.get(cls.name)
             selected = (player_class.name == cls.name)
             owned = (cls.name in owned_classes)
             fill = UI_BUTTON_HOVER if rect.collidepoint(mx_cs, my_cs) else UI_BUTTON_BG
@@ -5409,6 +4980,8 @@ def class_shop_menu():
                 line1 = f"{cls.name} — Selected"
             elif owned:
                 line1 = f"{cls.name} [{rarity}] — Owned (click to equip)"
+            elif cost is None:
+                line1 = f"{cls.name} [{rarity}] — Achievement unlock"
             else:
                 line1 = f"{cls.name} [{rarity}] — {cost} gems"
             line2 = CLASS_SHORT_DESC.get(cls.name, "")
@@ -5447,6 +5020,8 @@ def class_shop_menu():
                             save_game()
                             notify_once(f"{cls.name} equipped!", 800)
                             return
+                        if cost is None:
+                            continue
                         if gems >= cost:
                             gems -= cost
                             owned_classes.add(cls.name)
@@ -5460,125 +5035,10 @@ def class_shop_menu():
                     play_sound("menu_click")
                     save_game(); return
 
-# ---------- Lobby (create / join for online) ----------
+# ---------- Lobby (stub; online removed) ----------
 def lobby_screen():
-    """Create or join a lobby with name + password. Returns 'ok' when in a lobby, 'back' to cancel."""
-    lobby_name = ""
-    lobby_password = ""
-    focus = 0  # 0 = name, 1 = password
-    bar_w = 320
-    bar_h = 40
-    bar_x = WIDTH//2 - bar_w//2
-    name_y = HEIGHT//2 - 120
-    pass_y = HEIGHT//2 - 50
-    create_rect = pygame.Rect(WIDTH//2 - 110, HEIGHT//2 + 20, 100, 44)
-    join_rect = pygame.Rect(WIDTH//2 + 10, HEIGHT//2 + 20, 100, 44)
-    back_rect = pygame.Rect(WIDTH//2 - 60, HEIGHT//2 + 90, 120, 44)
-    waiting = None  # "create" or "join" while waiting for server
-    waiting_since_ms = None  # when we started waiting (for timeout)
-
-    while True:
-        screen.fill(bg_color)
-        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        overlay.fill(UI_OVERLAY_DARK)
-        screen.blit(overlay, (0, 0))
-        draw_text_centered(FONT_LG, "Online Lobby", HEIGHT//2 - 200, WHITE, y_is_center=True)
-        draw_text_centered(FONT_SM, "Lobby name", name_y - 24, (200, 200, 200))
-        draw_text_centered(FONT_SM, "Password", pass_y - 24, (200, 200, 200))
-        mx, my = pygame.mouse.get_pos()
-        now_ms = pygame.time.get_ticks()
-
-        for (y, text, is_pass) in [(name_y, lobby_name, False), (pass_y, lobby_password, True)]:
-            disp = ("*" * len(text)) if is_pass else text
-            border = (120, 180, 120) if (y == name_y and focus == 0) or (y == pass_y and focus == 1) else (80, 80, 80)
-            pygame.draw.rect(screen, (40, 40, 40), (bar_x, y, bar_w, bar_h))
-            pygame.draw.rect(screen, border, (bar_x, y, bar_w, bar_h), 3)
-            prompt = FONT_MD.render(disp + ("|" if (pygame.time.get_ticks() // 500) % 2 and ((y == name_y and focus == 0) or (y == pass_y and focus == 1)) else ""), True, (220, 220, 220))
-            screen.blit(prompt, (bar_x + 12, y + (bar_h - prompt.get_height())//2))
-
-        can_use = net and net.connected
-        if waiting and can_use:
-            if waiting_since_ms is None:
-                waiting_since_ms = now_ms
-            if now_ms - waiting_since_ms > 15000:
-                notify_once("No response from server - try again", 2500)
-                waiting = None
-                waiting_since_ms = None
-            else:
-                status = net.get_lobby_status()
-                if status == "created" or status == "joined":
-                    return "ok"
-                if isinstance(status, tuple) and status[0] == "error":
-                    notify_once(str(status[1])[:50], 2000)
-                    waiting = None
-                    waiting_since_ms = None
-                else:
-                    draw_text_centered(FONT_SM, "Waiting...", HEIGHT//2 + 75, (200, 200, 100), y_is_center=True)
-        else:
-            waiting_since_ms = None
-            draw_button(create_rect, "Create", hover=can_use and create_rect.collidepoint(mx, my), text_color=UI_TEXT)
-            draw_button(join_rect, "Join", hover=can_use and join_rect.collidepoint(mx, my), text_color=UI_TEXT)
-            draw_button(back_rect, "Back", hover=back_rect.collidepoint(mx, my), text_color=UI_TEXT)
-
-        if not (net and net.connected):
-            draw_text_centered(FONT_MD, "Connecting...", HEIGHT//2 - 168, (200, 200, 100), y_is_center=True)
-            if net and net.last_error:
-                err = net.last_error
-                if "61" in err or "refused" in err.lower() or "Connection refused" in err:
-                    draw_text_centered(FONT_SM, "Run in a terminal:  python game.py --server", HEIGHT//2 - 142, (220, 180, 120), y_is_center=True)
-                else:
-                    err = (err[:50] + "..") if len(err) > 50 else err
-                    draw_text_centered(FONT_XS, err, HEIGHT//2 - 148, (220, 120, 120), y_is_center=True)
-            else:
-                draw_text_centered(FONT_XS, "Run in a terminal:  python game.py --server", HEIGHT//2 - 132, (140, 140, 140), y_is_center=True)
-        else:
-            draw_text_centered(FONT_XS, "Create a new lobby or join one with name + password", HEIGHT//2 - 250, (160, 160, 160), y_is_center=True)
-        pygame.display.flip()
-
-        for ev in pygame.event.get():
-            if ev.type == pygame.QUIT:
-                return "back"
-            if ev.type == pygame.KEYDOWN:
-                if ev.key == pygame.K_ESCAPE:
-                    return "back"
-                if ev.key == pygame.K_TAB:
-                    focus = 1 - focus
-                    continue
-                if waiting:
-                    continue
-                target = lobby_name if focus == 0 else lobby_password
-                if ev.key == pygame.K_BACKSPACE:
-                    target = target[:-1]
-                elif ev.unicode and ev.unicode.isprintable() and len(target) < 32:
-                    target += ev.unicode
-                if focus == 0:
-                    lobby_name = target
-                else:
-                    lobby_password = target
-                continue
-            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1 and not waiting:
-                if pygame.Rect(bar_x, name_y, bar_w, bar_h).collidepoint(ev.pos):
-                    focus = 0
-                elif pygame.Rect(bar_x, pass_y, bar_w, bar_h).collidepoint(ev.pos):
-                    focus = 1
-                elif create_rect.collidepoint(ev.pos) and can_use:
-                    if not lobby_name.strip():
-                        notify_once("Enter a lobby name", 1200)
-                    else:
-                        play_sound("menu_click")
-                        net.send_create_lobby(lobby_name.strip(), lobby_password)
-                        waiting = "create"
-                elif join_rect.collidepoint(ev.pos) and can_use:
-                    if not lobby_name.strip():
-                        notify_once("Enter a lobby name", 1200)
-                    else:
-                        play_sound("menu_click")
-                        net.send_join_lobby(lobby_name.strip(), lobby_password)
-                        waiting = "join"
-                elif back_rect.collidepoint(ev.pos):
-                    play_sound("menu_click")
-                    return "back"
-        clock.tick(FPS)
+    """Stub: online removed. Returns 'back'."""
+    return "back"
 
 
 # Admin: type 6543 in game to get black screen, then type code in bar and Submit. Valid codes:
@@ -5608,7 +5068,12 @@ def admin_code_entry_screen():
         pygame.draw.rect(screen, sub_c, submit_rect)
         pygame.draw.rect(screen, (150, 150, 150), submit_rect, 3)
         screen.blit(FONT_MD.render("Submit", True, (220, 220, 220)), (submit_rect.x + (submit_rect.w - FONT_MD.size("Submit")[0])//2, submit_rect.y + (submit_rect.h - FONT_MD.get_height())//2))
-        draw_text_centered(FONT_XS, "Escape to cancel", HEIGHT - 40, (100, 100, 100))
+        escape_txt = "Escape to cancel"
+        escape_w, escape_h = FONT_XS.size(escape_txt)
+        escape_x = WIDTH//2 - escape_w//2
+        escape_rect = pygame.Rect(escape_x - 4, HEIGHT - 40 - 2, escape_w + 8, escape_h + 4)
+        escape_color = (140, 140, 140) if escape_rect.collidepoint(mx, my) else (100, 100, 100)
+        draw_text_centered(FONT_XS, escape_txt, HEIGHT - 40, escape_color)
         pygame.display.flip()
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
@@ -5631,10 +5096,15 @@ def admin_code_entry_screen():
                     if code in ADMIN_VALID_CODES:
                         admin_panel()
                     return
+                # Click "Escape to cancel" to open admin panel without typing code
+                if escape_rect.collidepoint(ev.pos):
+                    admin_panel()
+                    return
         clock.tick(FPS)
 
 def admin_panel():
-    """In-game admin panel. Codes: 3.141592653 or 3141592653. Scrollable, all abilities individual, extra cheats."""
+    """In-game admin panel. Codes: 3.141592653 or 3141592653. Scrollable, all abilities individual, extra cheats. Opening unlocks Hacker achievement."""
+    grant_achievement(HACKER_ACHIEVEMENT_BADGE)
     global gems, player_speed, owned_abilities, corrosive_level, arrow_damage, max_hp, player_hp
     global knockback_level, pierce_level, player_level, player_exp, exp_required, wave
     global in_collection_phase, collection_start_ms, collection_duration_ms, enemies
@@ -5915,7 +5385,7 @@ def settings_menu():
         clock.tick(FPS)
 
 def main_menu():
-    global online_mode, current_save_slot, net
+    global current_save_slot
     refresh_all_slot_meta()
 
     while True:
@@ -5931,16 +5401,10 @@ def main_menu():
         resume_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 - 40, btn_w, btn_h)
         quit_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 + 60, btn_w, btn_h)
         class_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 + 160, btn_w, btn_h)
-        online_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 + 260, btn_w, btn_h)
 
         for rect, label in [(new_rect, "Create New Game"), (resume_rect, "Resume Game"), (quit_rect, "Quit")]:
             draw_button(rect, label, hover=rect.collidepoint(mx, my))
         draw_button(class_rect, "Classes", hover=class_rect.collidepoint(mx, my))
-        if not ONLINE_ENABLED:
-            online_label = "Online (closed)"
-        else:
-            online_label = "Online" if websockets is not None else "Online (pip install websockets)"
-        draw_button(online_rect, online_label, hover=online_rect.collidepoint(mx, my))
 
         meta_now = load_slot_meta(current_save_slot)
         g = int(meta_now.get("gems", 0))
@@ -6002,7 +5466,6 @@ def main_menu():
 
                 if new_rect.collidepoint(ev.pos):
                     play_sound("menu_click")
-                    online_mode = False
                     reset_game()
                     return "new"
                 if resume_rect.collidepoint(ev.pos):
@@ -6018,20 +5481,6 @@ def main_menu():
                     reset_game()
                     load_game()  # load slot gems/class for shop if exists
                     class_shop_menu()
-                if online_rect.collidepoint(ev.pos):
-                    play_sound("menu_click")
-                    if not ONLINE_ENABLED:
-                        notify_once("Online is temporarily closed", 1200)
-                    elif websockets is None:
-                        notify_once("Install websockets first", 1200)
-                    else:
-                        online_mode = True
-                        reset_game()
-                        result = lobby_screen()
-                        if result == "ok":
-                            return "new"
-                        online_mode = False
-                        net = None
                 if settings_rect.collidepoint(ev.pos):
                     play_sound("menu_click")
                     settings_menu()
@@ -6072,13 +5521,16 @@ def game_loop():
     global in_collection_phase, collection_start_ms, collection_duration_ms
     global spawn_preview_active, spawn_preview_start_ms, spawn_preview_ms
     global corrosive_level
-    global net, online_mode
     global vampire_fly_until_ms, vampire_fly_cooldown_until_ms
     global assassin_invis_until_ms, assassin_invis_cooldown_until_ms
+    global archer_dash_until_ms, archer_dash_cooldown_until_ms, archer_dash_vx, archer_dash_vy
+    global hacker_fly_until_ms, hacker_fly_cooldown_until_ms, hacker_invis_until_ms, hacker_invis_cooldown_until_ms
+    global hacker_freeze_cooldown_until_ms, hacker_flame_cooldown_until_ms, hacker_teleport_cooldown_until_ms, hacker_teleport_pending
     global mad_scientist_overcharge_until_ms, mad_scientist_overcharge_cooldown_until_ms
     global assassin_active_bounties, assassin_bounty_refresh_at_ms
     global robbers_gun
     global flame_bomb_ball, flame_bomb_zone
+    global last_flame_archer_flame_tick_ms, flame_archer_flame_active, flame_archer_weapon
 
     gems_this_run = 0
     player.center = (WIDTH//2, HEIGHT//2)
@@ -6090,30 +5542,13 @@ def game_loop():
     last_corrosive_damage_ms = 0
     wave_banner_until_ms = 0
     wave_banner_number = 0
-    online_disconnect_since_ms = None  # set when we detect disconnect in online mode
 
     while running:
         dt = clock.tick(FPS) 
         now_ms = pygame.time.get_ticks()
-        # Online: detect disconnect and return to menu after 3s
-        if online_mode and net is not None:
-            if not net.connected:
-                if online_disconnect_since_ms is None:
-                    online_disconnect_since_ms = now_ms
-                elif now_ms - online_disconnect_since_ms >= 3000:
-                    for _ in range(60):
-                        screen.fill((30, 20, 20))
-                        draw_text_centered(FONT_LG, "Disconnected", HEIGHT//2 - 30, (220, 100, 100), y_is_center=True)
-                        draw_text_centered(FONT_SM, "Returning to menu...", HEIGHT//2 + 20, (180, 180, 180), y_is_center=True)
-                        pygame.display.flip()
-                        pygame.event.pump()
-                        clock.tick(20)
-                    online_mode = False
-                    net = None
-                    return
-            else:
-                online_disconnect_since_ms = None
         update_fx(dt)
+        vampire_fly = (isinstance(player_class, Vampire) and now_ms < vampire_fly_until_ms) or (isinstance(player_class, Hacker) and now_ms < hacker_fly_until_ms)
+        assassin_invis = (isinstance(player_class, Assassin) and now_ms < assassin_invis_until_ms) or (isinstance(player_class, Hacker) and now_ms < hacker_invis_until_ms)
         # class passive update
         try:
             player_class.on_update(now_ms)
@@ -6141,10 +5576,7 @@ def game_loop():
                         continue
 
                     if ev.key == pygame.K_RETURN:
-                        if online_mode and net is not None:
-                            net.send_chat(chat_input)
-                        else:
-                            add_chat_message(ONLINE_USERNAME, chat_input)
+                        add_chat_message("Player", chat_input)
                         chat_input = ""
                         chat_open = False
                         continue
@@ -6191,8 +5623,7 @@ def game_loop():
                         weapon = "sword"
                 if isinstance(player_class, Robber):
                     if ev.key == pygame.K_3: robbers_gun = "shotgun"
-                    if ev.key == pygame.K_4: robbers_gun = "flamethrower"
-                    if ev.key == pygame.K_5: robbers_gun = "sniper"
+                    if ev.key == pygame.K_4: robbers_gun = "sniper"
                 if ev.key == pygame.K_v and isinstance(player_class, Vampire):
                     if now_ms >= vampire_fly_cooldown_until_ms and now_ms >= vampire_fly_until_ms:
                         vampire_fly_until_ms = now_ms + Vampire.FLY_DURATION_MS
@@ -6203,6 +5634,28 @@ def game_loop():
                         assassin_invis_until_ms = now_ms + Assassin.INVIS_DURATION_MS
                         assassin_invis_cooldown_until_ms = now_ms + Assassin.INVIS_COOLDOWN_MS
                         floating_texts.append({"x": player.centerx, "y": player.centery - 30, "txt": "Invisible!", "color": PURPLE, "ttl": 800, "vy": -0.5, "alpha": 255})
+                if ev.key == pygame.K_r and isinstance(player_class, NoClass):
+                    if now_ms >= archer_dash_cooldown_until_ms and now_ms >= archer_dash_until_ms:
+                        keys = pygame.key.get_pressed()
+                        dx, dy = 0, 0
+                        if keys[pygame.K_w]: dy -= 1
+                        if keys[pygame.K_s]: dy += 1
+                        if keys[pygame.K_a]: dx -= 1
+                        if keys[pygame.K_d]: dx += 1
+                        if dx != 0 or dy != 0:
+                            d = math.hypot(dx, dy) or 1
+                            dx, dy = dx / d, dy / d
+                        else:
+                            mx, my = pygame.mouse.get_pos()
+                            dx = mx - player.centerx
+                            dy = my - player.centery
+                            d = math.hypot(dx, dy) or 1
+                            dx, dy = dx / d, dy / d
+                        archer_dash_until_ms = now_ms + ARCHER_DASH_DURATION_MS
+                        archer_dash_cooldown_until_ms = now_ms + ARCHER_DASH_COOLDOWN_MS
+                        archer_dash_vx = dx
+                        archer_dash_vy = dy
+                        floating_texts.append({"x": player.centerx, "y": player.centery - 30, "txt": "Dash!", "color": CYAN, "ttl": 600, "vy": -0.5, "alpha": 255})
                 if ev.key == pygame.K_v and isinstance(player_class, MadScientist):
                     if now_ms >= mad_scientist_overcharge_cooldown_until_ms and now_ms >= mad_scientist_overcharge_until_ms:
                         mad_scientist_overcharge_until_ms = now_ms + MadScientist.OVERCHARGE_DURATION_MS
@@ -6220,6 +5673,7 @@ def game_loop():
                             "cx": flame_bomb_ball["x"], "cy": flame_bomb_ball["y"],
                             "ttl_ms": FLAME_BOMB_ZONE_DURATION_MS, "radius": FLAME_BOMB_ZONE_RADIUS,
                             "last_burn_tick_ms": now_ms,
+                            "created_ms": now_ms,
                         }
                         flame_bomb_ball = None
                     else:
@@ -6232,6 +5686,11 @@ def game_loop():
                             "vx": FLAME_BOMB_BALL_SPEED * dx / d, "vy": FLAME_BOMB_BALL_SPEED * dy / d,
                         }
                     continue
+                # Flame Archer mastery: 1 = bow, 3 = flamethrower
+                if ev.key == pygame.K_1 and isinstance(player_class, FlameArcher) and flame_mastery_unlocked:
+                    flame_archer_weapon = "bow"
+                if ev.key == pygame.K_3 and isinstance(player_class, FlameArcher) and flame_mastery_unlocked:
+                    flame_archer_weapon = "flamethrower"
                 if in_collection_phase and ev.key == pygame.K_SPACE:
                     for orb in pending_orbs[:]:
                         player_exp += orb["amount"]
@@ -6249,15 +5708,38 @@ def game_loop():
             if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 mx,my = ev.pos
 
+                # Hacker: teleport to click (when pending) or terminal command
+                if isinstance(player_class, Hacker):
+                    if hacker_teleport_pending and my < HEIGHT - HACKER_TERMINAL_HEIGHT:
+                        player.centerx = max(player.width // 2, min(WIDTH - player.width // 2, mx))
+                        player.centery = max(player.height // 2, min(HEIGHT - HACKER_TERMINAL_HEIGHT - player.height // 2, my))
+                        hacker_teleport_pending = False
+                        floating_texts.append({"x": player.centerx, "y": player.centery - 20, "txt": "Teleported!", "color": (150, 255, 150), "ttl": 600, "vy": -0.5, "alpha": 255})
+                        continue
+                    bar, buttons = get_hacker_terminal_layout()
+                    if bar.collidepoint(mx, my):
+                        for rect, cmd in buttons:
+                            if rect.collidepoint(mx, my) and trigger_hacker_command(cmd, now_ms):
+                                play_sound("menu_click")
+                                break
+                        continue
+
                 # Save button
-                save_btn = pygame.Rect(WIDTH - 120, HEIGHT - 60, 100, 40)
+                save_btn_y = HEIGHT - 56 - 40 - 10 if isinstance(player_class, Hacker) else HEIGHT - 60
+                save_btn = pygame.Rect(WIDTH - 120, save_btn_y, 100, 40)
                 if save_btn.collidepoint(mx,my):
                     save_game()
                     floating_texts.append({"x":save_btn.centerx,"y":save_btn.top-10,"txt":"Saved!","color":BLUE,"ttl":45,"vy":-0.6,"alpha":255})
                     continue
+                # Admin (click text at bottom to open panel instead of typing code)
+                admin_btn = pygame.Rect(12, HEIGHT - 32, 52, 24)
+                if admin_btn.collidepoint(mx, my):
+                    admin_panel()
+                    continue
                 # Hit List button (Assassin only)
                 if isinstance(player_class, Assassin):
-                    hitlist_btn = pygame.Rect(WIDTH - 230, HEIGHT - 60, 100, 40)
+                    hitlist_btn_y = HEIGHT - 56 - 40 - 10 if isinstance(player_class, Hacker) else HEIGHT - 60
+                    hitlist_btn = pygame.Rect(WIDTH - 230, hitlist_btn_y, 100, 40)
                     if hitlist_btn.collidepoint(mx, my):
                         hit_list_menu()
                         continue
@@ -6282,7 +5764,9 @@ def game_loop():
                 if isinstance(player_class, Robber):
                     update_robber_guns(now_ms, mx, my, True, True)
                 elif weapon == "bow":
-                    shoot_bow(mx,my)
+                    # Flame Archer with flamethrower selected: don't shoot bow (hold fires flamethrower in update)
+                    if not (isinstance(player_class, FlameArcher) and flame_mastery_unlocked and flame_archer_weapon == "flamethrower"):
+                        shoot_bow(mx,my)
                 else:
                     handle_sword_attack(mx,my)
 
@@ -6296,16 +5780,26 @@ def game_loop():
             flame_bomb_zone["ttl_ms"] -= dt
             if flame_bomb_zone["ttl_ms"] <= 0:
                 flame_bomb_zone = None
-            elif not online_mode:
-                if now_ms - flame_bomb_zone.get("last_burn_tick_ms", 0) >= 1000:
+            else:
+                if now_ms - flame_bomb_zone.get("last_burn_tick_ms", 0) >= FLAME_BOMB_ZONE_TICK_MS:
                     flame_bomb_zone["last_burn_tick_ms"] = now_ms
                     cx = flame_bomb_zone["cx"]
                     cy = flame_bomb_zone["cy"]
                     r = flame_bomb_zone["radius"]
+                    dmg = max(1, int(arrow_damage * FLAME_BOMB_ZONE_DMG_PER_TICK))
                     for e in enemies[:]:
                         if math.hypot(e.rect.centerx - cx, e.rect.centery - cy) <= r:
+                            e.hp -= dmg
                             e.burn_ms_left = max(getattr(e, "burn_ms_left", 0), FLAME_BOMB_ZONE_BURN_MS)
                             e.last_status_tick = 0
+                            floating_texts.append({"x": e.rect.centerx, "y": e.rect.top - 12, "txt": f"-{dmg}", "color": ORANGE, "ttl": 800, "vy": -0.5, "alpha": 255})
+                            if e.hp <= 0:
+                                record_flame_mastery_progress(e, dot_final_blow=False)
+                                record_assassin_kill(e)
+                                score += 1
+                                spawn_orb(e.rect.centerx, e.rect.centery, amount=1)
+                                try: enemies.remove(e)
+                                except: pass
 
         def _player_in_flame_bomb_zone():
             if flame_bomb_zone is None:
@@ -6315,67 +5809,71 @@ def game_loop():
         # movement (disabled while typing). Vampire fly = 1.5x speed; Flame Bomb zone = 1.5x speed
         keys = pygame.key.get_pressed()
         if not chat_open:
-            speed = player_speed * (Vampire.FLY_SPEED_MULT if (isinstance(player_class, Vampire) and now_ms < vampire_fly_until_ms) else 1.0)
-            if isinstance(player_class, FlameArcher) and _player_in_flame_bomb_zone():
-                speed *= 1.5
-            if keys[pygame.K_w]: player.y -= speed
-            if keys[pygame.K_s]: player.y += speed
-            if keys[pygame.K_a]: player.x -= speed
-            if keys[pygame.K_d]: player.x += speed
+            archer_dashing = isinstance(player_class, NoClass) and now_ms < archer_dash_until_ms
+            if archer_dashing:
+                player.x += int(archer_dash_vx * ARCHER_DASH_SPEED)
+                player.y += int(archer_dash_vy * ARCHER_DASH_SPEED)
+            else:
+                speed = player_speed * (Vampire.FLY_SPEED_MULT if vampire_fly else 1.0)
+                if isinstance(player_class, FlameArcher) and _player_in_flame_bomb_zone():
+                    speed *= 1.5
+                if keys[pygame.K_w]: player.y -= speed
+                if keys[pygame.K_s]: player.y += speed
+                if keys[pygame.K_a]: player.x -= speed
+                if keys[pygame.K_d]: player.x += speed
         player.clamp_ip(screen.get_rect())
 
-        # Robber: hold-to-fire (AK, flamethrower) and minigun auto-fire
+        # Robber: hold-to-fire (AK) and minigun auto-fire
         if isinstance(player_class, Robber):
             mx, my = pygame.mouse.get_pos()
             update_robber_guns(now_ms, mx, my, pygame.mouse.get_pressed()[0], False)
 
-        vampire_fly = isinstance(player_class, Vampire) and now_ms < vampire_fly_until_ms
-        assassin_invis = isinstance(player_class, Assassin) and now_ms < assassin_invis_until_ms
+        # Flame Archer mastery: flamethrower in slot 3 (hold left mouse when selected)
+        if isinstance(player_class, FlameArcher) and flame_mastery_unlocked:
+            left_held = pygame.mouse.get_pressed()[0]
+            flame_archer_flame_active = (flame_archer_weapon == "flamethrower" and left_held and not in_collection_phase)
+            if flame_archer_flame_active and now_ms - last_flame_archer_flame_tick_ms >= FLAME_THROWER_TICK_MS:
+                last_flame_archer_flame_tick_ms = now_ms
+                mx, my = pygame.mouse.get_pos()
+                ang = math.atan2(my - player.centery, mx - player.centerx)
+                half = FLAME_THROWER_CONE_ANGLE_RAD / 2
+                dmg = max(1, int(arrow_damage * FLAME_THROWER_DMG_PER_TICK))
+                for enemy in enemies[:]:
+                    ex = enemy.rect.centerx - player.centerx
+                    ey = enemy.rect.centery - player.centery
+                    dist = math.hypot(ex, ey)
+                    if dist > FLAME_THROWER_CONE_RANGE:
+                        continue
+                    eang = math.atan2(ey, ex)
+                    diff = abs((eang - ang + math.pi) % (2 * math.pi) - math.pi)
+                    if diff <= half:
+                        enemy.hp -= dmg
+                        enemy.burn_ms_left = max(getattr(enemy, "burn_ms_left", 0), FLAME_THROWER_BURN_MS)
+                        enemy.last_status_tick = 0
+                        floating_texts.append({"x": enemy.rect.centerx, "y": enemy.rect.top - 12, "txt": f"-{dmg}", "color": ORANGE, "ttl": 800, "vy": -0.5, "alpha": 255})
+                        if enemy.hp <= 0:
+                            record_flame_mastery_progress(enemy, dot_final_blow=False)
+                            record_assassin_kill(enemy)
+                            score += 1
+                            spawn_orb(enemy.rect.centerx, enemy.rect.centery, amount=1)
+                            try: enemies.remove(enemy)
+                            except: pass
+        else:
+            flame_archer_flame_active = False
 
         # Assassin: init or refresh bounties on timer
         if isinstance(player_class, Assassin):
             if not assassin_active_bounties or now_ms >= assassin_bounty_refresh_at_ms:
                 refresh_assassin_bounties()
 
-        # online snapshots
-        net_players = {}
-        net_enemies = {}
-        net_shots = []
-        net_chat = []
-        if online_mode and net is not None:
-            net.send_input_throttled(player.centerx, player.centery, weapon)
-            net_players, net_enemies, net_shots, net_chat = net.snapshot()
-
-            if net_chat:
-                chat_messages[:] = [{"name": m.get("name", ""), "msg": m.get("msg", ""), "ts": 0} for m in net_chat][-60:]
-
-            # remote arrows: only show other players' shots (skip our own; need id from server)
-            myid = net.id
-            if myid is not None:
-                for s in net_shots:
-                    if s.get("pid") == myid:
-                        continue
-                    remote_arrows.append(RemoteArrow(s.get("x",0), s.get("y",0), s.get("vx",0), s.get("vy",0), ttl_ms=650))
-
-        # server-authoritative enemies (mirror)
-        if online_mode and online_coop_enemies and net is not None and net_enemies:
-            enemies.clear()
-            for eid, ed in net_enemies.items():
-                r = pygame.Rect(int(ed.get("x",0)), int(ed.get("y",0)), int(ed.get("w",30)), int(ed.get("h",30)))
-                obj = Enemy(r, str(ed.get("etype","normal")))
-                obj.hp = float(ed.get("hp", 1))
-                obj._net_id = str(eid)
-                enemies.append(obj)
-
-        # spawn preview (offline only)
-        if not online_mode:
-            if spawn_preview_active and now_ms - spawn_preview_start_ms >= spawn_preview_ms:
-                spawn_preview_active = False
-                globals()["first_arrow_hit_this_wave"] = False
-                if wave % 10 == 0:
-                    spawn_boss()
-                else:
-                    spawn_wave(enemies_per_wave)
+        # spawn preview
+        if spawn_preview_active and now_ms - spawn_preview_start_ms >= spawn_preview_ms:
+            spawn_preview_active = False
+            globals()["first_arrow_hit_this_wave"] = False
+            if wave % 20 == 0:
+                spawn_boss()
+            else:
+                spawn_wave(enemies_per_wave)
 
         # update arrows
         for a in arrows[:]:
@@ -6395,8 +5893,8 @@ def game_loop():
                 try: enemy_arrows.remove(ea)
                 except: pass
 
-        # Corrosive ability: damage enemies in field (offline only)
-        if not online_mode and owned_abilities.get("Corrosive", False) and corrosive_level >= 1:
+        # Corrosive ability: damage enemies in field
+        if owned_abilities.get("Corrosive", False) and corrosive_level >= 1:
             if now_ms - last_corrosive_damage_ms >= 500:
                 last_corrosive_damage_ms = now_ms
                 radius = CORROSIVE_BASE_RADIUS * (0.6 + 0.08 * min(corrosive_level, 5))
@@ -6414,42 +5912,47 @@ def game_loop():
                             try: enemies.remove(enemy)
                             except: pass
 
-        # enemies update (offline/local side only)
-        if not online_mode:
-            for enemy in enemies[:]:
-                if getattr(enemy,"is_boss",False):
-                    boss_try_summon(enemy)
+        # enemies update
+        for enemy in enemies[:]:
+            if getattr(enemy,"is_boss",False):
+                boss_try_summon(enemy)
+                boss_try_shoot(enemy)
+                boss_try_slam(enemy, assassin_invis)
+                boss_try_charge(enemy)
 
-                if not assassin_invis:
-                    proj = enemy.try_shoot(now_ms)
-                    if proj:
-                        enemy_arrows.append(EnemyArrow(proj["rect"], proj["vx"], proj["vy"], proj["damage"]))
+            if not assassin_invis:
+                proj = enemy.try_shoot(now_ms)
+                if proj:
+                    enemy_arrows.append(EnemyArrow(proj["rect"], proj["vx"], proj["vy"], proj["damage"]))
 
-                if not assassin_invis:
+            if not assassin_invis:
+                if getattr(enemy, "is_boss", False) and boss_update_charge(enemy, now_ms):
+                    pass
+                else:
                     enemy.move_towards(player.centerx, player.centery)
-                enemy.apply_status(now_ms)
+            enemy.apply_status(now_ms)
 
-                if enemy.hp <= 0:
-                    record_flame_mastery_progress(enemy, dot_final_blow=getattr(enemy, "_killed_by_burn_dot", False))
-                    record_assassin_kill(enemy)
-                    score += 1
-                    spawn_orb(enemy.rect.centerx, enemy.rect.centery, amount=1)
+            if enemy.hp <= 0:
+                record_flame_mastery_progress(enemy, dot_final_blow=getattr(enemy, "_killed_by_burn_dot", False))
+                record_assassin_kill(enemy)
+                score += 1
+                spawn_orb(enemy.rect.centerx, enemy.rect.centery, amount=1)
+                try: enemies.remove(enemy)
+                except: pass
+                continue
+
+            if player.colliderect(enemy.rect):
+                if not vampire_fly and not assassin_invis:
+                    dmg = enemy.damage
+                    if isinstance(player_class, Knight):
+                        dmg = int(math.ceil(dmg*0.90))
+                    if not admin_god_mode:
+                        player_hp -= dmg
                     try: enemies.remove(enemy)
                     except: pass
-                    continue
-
-                if player.colliderect(enemy.rect):
-                    if not vampire_fly and not assassin_invis:
-                        dmg = enemy.damage
-                        if isinstance(player_class, Knight):
-                            dmg = int(math.ceil(dmg*0.90))
-                        if not admin_god_mode:
-                            player_hp -= dmg
-                        try: enemies.remove(enemy)
-                        except: pass
-                        if not admin_god_mode and player_hp <= 0:
-                            play_sound("death")
-                            game_over_screen(); reset_game(); return
+                    if not admin_god_mode and player_hp <= 0:
+                        play_sound("death")
+                        game_over_screen(); reset_game(); return
 
         # enemy arrows hit player (only Assassin invis blocks; Vampire fly = archers can hit)
         for ea in enemy_arrows[:]:
@@ -6477,21 +5980,7 @@ def game_loop():
                 if enemy.rect.colliderect(a.rect):
                     dmg_override = getattr(a, "damage_override", None)
                     hit_dmg = dmg_override if dmg_override is not None else arrow_damage
-                    if online_mode and net is not None and hasattr(enemy, "_net_id"):
-                        net.send_hit(enemy._net_id, hit_dmg)
-
-
-                        # online EXP + gems (client-side immediate)
-                        player_exp += 1
-                        gems += 1
-                        gems_this_run += 1
-                        while player_exp >= exp_required:
-                            player_exp -= exp_required
-                            player_level += 1
-                            exp_required = 10 + 10 * (player_level - 1)
-                            play_sound("levelup")
-                    else:
-                        handle_arrow_hit(enemy, hit_dmg)
+                    handle_arrow_hit(enemy, hit_dmg)
                     if getattr(a,"pierce_remaining",0) > 0:
                         a.pierce_remaining -= 1
                     else:
@@ -6499,63 +5988,63 @@ def game_loop():
                         except: pass
                     break
 
-        # collection phase (offline only)
-        if not online_mode:
-            if not enemies and not in_collection_phase and not spawn_preview_active:
-                in_collection_phase = True
-                collection_start_ms = pygame.time.get_ticks()
+        # collection phase
+        if not enemies and not in_collection_phase and not spawn_preview_active:
+            in_collection_phase = True
+            collection_start_ms = pygame.time.get_ticks()
 
-            if in_collection_phase:
+        if in_collection_phase:
+            for orb in pending_orbs[:]:
+                dx = player.centerx - orb["x"]; dy = player.centery - orb["y"]
+                dist = math.hypot(dx,dy) or 1.0
+                speed = 4 + min(8, dist/20.0)
+                orb["x"] += (dx/dist)*speed
+                orb["y"] += (dy/dist)*speed
+                if math.hypot(orb["x"]-player.centerx, orb["y"]-player.centery) < 20:
+                    player_exp += orb["amount"]
+                    gems += orb["amount"]
+                    gems_this_run += orb["amount"]
+                    if owned_abilities.get("Bounty", False) and random.random() < 0.25:
+                        gems += 1
+                        gems_this_run += 1
+                    if owned_abilities.get("Scavenger", False) and random.random() < 0.20:
+                        player_exp += 5
+                    try: pending_orbs.remove(orb)
+                    except: pass
+
+            if pygame.time.get_ticks() - collection_start_ms >= collection_duration_ms:
                 for orb in pending_orbs[:]:
-                    dx = player.centerx - orb["x"]; dy = player.centery - orb["y"]
-                    dist = math.hypot(dx,dy) or 1.0
-                    speed = 4 + min(8, dist/20.0)
-                    orb["x"] += (dx/dist)*speed
-                    orb["y"] += (dy/dist)*speed
-                    if math.hypot(orb["x"]-player.centerx, orb["y"]-player.centery) < 20:
-                        player_exp += orb["amount"]
-                        gems += orb["amount"]
-                        gems_this_run += orb["amount"]
-                        if owned_abilities.get("Bounty", False) and random.random() < 0.25:
-                            gems += 1
-                            gems_this_run += 1
-                        if owned_abilities.get("Scavenger", False) and random.random() < 0.20:
-                            player_exp += 5
-                        try: pending_orbs.remove(orb)
-                        except: pass
+                    player_exp += orb["amount"]
+                    gems += orb["amount"]
+                    gems_this_run += orb["amount"]
+                    if owned_abilities.get("Bounty", False) and random.random() < 0.25:
+                        gems += 1
+                        gems_this_run += 1
+                    if owned_abilities.get("Scavenger", False) and random.random() < 0.20:
+                        player_exp += 5
+                    try: pending_orbs.remove(orb)
+                    except: pass
+                in_collection_phase = False
 
-                if pygame.time.get_ticks() - collection_start_ms >= collection_duration_ms:
-                    for orb in pending_orbs[:]:
-                        player_exp += orb["amount"]
-                        gems += orb["amount"]
-                        gems_this_run += orb["amount"]
-                        if owned_abilities.get("Bounty", False) and random.random() < 0.25:
-                            gems += 1
-                            gems_this_run += 1
-                        if owned_abilities.get("Scavenger", False) and random.random() < 0.20:
-                            player_exp += 5
-                        try: pending_orbs.remove(orb)
-                        except: pass
-                    in_collection_phase = False
+                # Level up: excess EXP carries over to next level; multiple level-ups in one gain each get an ability choice
+                while player_exp >= exp_required:
+                    player_exp -= exp_required
+                    player_level += 1
+                    exp_required = 10 + 10 * (player_level - 1)
+                    play_sound("levelup")
+                    ability_choice_between_waves()
 
-                    leveled = False
-                    while player_exp >= exp_required:
-                        player_exp -= exp_required
-                        player_level += 1
-                        exp_required = 10 + 10*(player_level-1)
-                        leveled = True
-
-                    if leveled:
-                        play_sound("levelup")
-                        ability_choice_between_waves()
-
-                    save_game()
-                    spawn_preview_active = True
-                    spawn_preview_start_ms = pygame.time.get_ticks()
-                    player.center = (WIDTH//2, HEIGHT//2)
-                    wave += 1
-                    wave_banner_number = wave
-                    wave_banner_until_ms = now_ms + 2200
+                save_game()
+                spawn_preview_active = True
+                spawn_preview_start_ms = pygame.time.get_ticks()
+                player.center = (WIDTH//2, HEIGHT//2)
+                wave += 1
+                wave_banner_number = wave
+                wave_banner_until_ms = now_ms + 2200
+                # Refresh enemy count every boss wave; otherwise scale up
+                if wave % 20 == 1:  # just finished a boss wave (wave 20, 40, ...)
+                    enemies_per_wave = DEFAULTS["enemies_per_wave_start"]
+                else:
                     enemies_per_wave = max(1, int(round(enemies_per_wave*1.1)))
 
         # ---------- DRAW ----------
@@ -6577,19 +6066,56 @@ def game_loop():
                 screen.blit(outline, (bx + dx, by + dy))
             screen.blit(banner_surf, (bx, by))
 
-        # Flame Bomb zone (orange tint circle)
+        # Flame Bomb zone (orange tint + explosion when first created)
         if flame_bomb_zone is not None:
             cx, cy = int(flame_bomb_zone["cx"]), int(flame_bomb_zone["cy"])
             rad = flame_bomb_zone["radius"]
-            alpha = min(80, 40 + flame_bomb_zone["ttl_ms"] // 100)
-            surf = pygame.Surface((rad * 2 + 10, rad * 2 + 10), pygame.SRCALPHA)
-            pygame.draw.circle(surf, (255, 140, 50, alpha), (rad + 5, rad + 5), rad)
-            screen.blit(surf, (cx - rad - 5, cy - rad - 5))
-        # Flame Bomb ball (red projectile)
+            created_ms = flame_bomb_zone.get("created_ms", 0)
+            explosion_age_ms = now_ms - created_ms
+            # Explosion effect (first 450ms): flash + expanding rings
+            if explosion_age_ms < 450:
+                t = explosion_age_ms / 450.0
+                # Bright center flash (fades in first 60ms, holds, fades out)
+                flash_alpha = 220 if explosion_age_ms < 80 else max(0, 220 - (explosion_age_ms - 80) * 2)
+                if flash_alpha > 0:
+                    flash_r = int(25 + explosion_age_ms * 0.4)
+                    flash_surf = pygame.Surface((flash_r * 2 + 4, flash_r * 2 + 4), pygame.SRCALPHA)
+                    pygame.draw.circle(flash_surf, (255, 240, 180, int(flash_alpha)), (flash_r + 2, flash_r + 2), flash_r)
+                    screen.blit(flash_surf, (cx - flash_r - 2, cy - flash_r - 2))
+                # Expanding ring 1 (orange)
+                ring1_r = int(30 + t * (rad - 20))
+                ring1_alpha = int(180 * (1 - t))
+                if ring1_alpha > 0 and ring1_r < rad + 50:
+                    rs = ring1_r * 2 + 8
+                    ring_surf = pygame.Surface((rs, rs), pygame.SRCALPHA)
+                    pygame.draw.circle(ring_surf, (255, 160, 50, ring1_alpha), (ring1_r + 4, ring1_r + 4), ring1_r, 4)
+                    screen.blit(ring_surf, (cx - ring1_r - 4, cy - ring1_r - 4))
+                # Expanding ring 2 (red-orange, slightly delayed)
+                if explosion_age_ms > 80:
+                    t2 = (explosion_age_ms - 80) / 370.0
+                    ring2_r = int(15 + t2 * (rad - 10))
+                    ring2_alpha = int(140 * (1 - t2))
+                    if ring2_alpha > 0 and ring2_r < rad + 50:
+                        rs2 = ring2_r * 2 + 8
+                        ring2_surf = pygame.Surface((rs2, rs2), pygame.SRCALPHA)
+                        pygame.draw.circle(ring2_surf, (255, 90, 30, ring2_alpha), (ring2_r + 4, ring2_r + 4), ring2_r, 3)
+                        screen.blit(ring2_surf, (cx - ring2_r - 4, cy - ring2_r - 4))
+            # Steady zone: gradient-style (inner brighter, outer dimmer)
+            alpha = min(100, 50 + flame_bomb_zone["ttl_ms"] // 80)
+            big = rad * 2 + 20
+            surf = pygame.Surface((big, big), pygame.SRCALPHA)
+            # Outer glow
+            pygame.draw.circle(surf, (255, 120, 40, alpha // 2), (big // 2, big // 2), rad + 4)
+            # Main fill
+            pygame.draw.circle(surf, (255, 140, 50, alpha), (big // 2, big // 2), rad)
+            # Inner bright core
+            pygame.draw.circle(surf, (255, 180, 80, min(alpha + 30, 140)), (big // 2, big // 2), rad // 2)
+            screen.blit(surf, (cx - big // 2, cy - big // 2))
+        # Flame Bomb ball (red projectile, 2x size)
         if flame_bomb_ball is not None:
             bx, by = int(flame_bomb_ball["x"]), int(flame_bomb_ball["y"])
-            pygame.draw.circle(screen, (220, 40, 40), (bx, by), 12)
-            pygame.draw.circle(screen, (255, 80, 80), (bx, by), 8)
+            pygame.draw.circle(screen, (220, 40, 40), (bx, by), 24)
+            pygame.draw.circle(screen, (255, 80, 80), (bx, by), 16)
 
         # corrosive field visual (Mythical ability only)
         if owned_abilities.get("Corrosive", False) and corrosive_level >= 1:
@@ -6604,56 +6130,64 @@ def game_loop():
         else:
             pygame.draw.rect(screen, player_class.color, player)
 
-        # remote players
-        if online_mode and net is not None:
-            for pid, p in net_players.items():
-                if net.id is not None and pid == net.id:
-                    continue
-                rx, ry = int(p.get("x",0)), int(p.get("y",0))
-                r = pygame.Rect(rx - player.width//2, ry - player.height//2, player.width, player.height)
-                pygame.draw.rect(screen, (60,160,255), r)
-                nm = str(p.get("name", pid))
-                tag = FONT_SM.render(nm, True, BLACK)
-                screen.blit(tag, (r.x, r.y - 18))
-
-        # weapon visuals (hidden when Assassin invisible)
-        if not assassin_invis and isinstance(player_class, Robber):
+        # weapon visuals (always visible; invisibility applies to character model only)
+        if isinstance(player_class, Robber):
             mx, my = pygame.mouse.get_pos()
             ang = math.atan2(my - player.centery, mx - player.centerx)
             gun_len = 50
             tipx = int(player.centerx + gun_len * math.cos(ang))
             tipy = int(player.centery + gun_len * math.sin(ang))
-            gun_colors = {"ak47": (60, 60, 60), "minigun": (80, 70, 60), "shotgun": (90, 50, 30), "flamethrower": (200, 100, 0), "sniper": (40, 50, 40)}
+            gun_colors = {"ak47": (60, 60, 60), "minigun": (80, 70, 60), "shotgun": (90, 50, 30), "sniper": (40, 50, 40)}
             pygame.draw.line(screen, gun_colors.get(robbers_gun, (60, 60, 60)), (player.centerx, player.centery), (tipx, tipy), 5)
-            # Visible flamethrower cone when firing
-            if robbers_gun == "flamethrower" and robber_flame_active:
-                half = ROBBER_FLAME_CONE_ANGLE_RAD / 2
-                cx, cy = player.centerx, player.centery
-                r = ROBBER_FLAME_CONE_RANGE
-                left_ang = ang - half
-                right_ang = ang + half
-                x1 = cx + r * math.cos(left_ang)
-                y1 = cy + r * math.sin(left_ang)
-                x2 = cx + r * math.cos(right_ang)
-                y2 = cy + r * math.sin(right_ang)
-                pts = [(cx, cy), (x1, y1), (x2, y2)]
-                flame_surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-                pygame.draw.polygon(flame_surf, (255, 140, 0, 140), pts)
-                pygame.draw.polygon(flame_surf, (255, 200, 50, 90), [(cx, cy), (cx + 0.7*r*math.cos(left_ang), cy + 0.7*r*math.sin(left_ang)), (cx + 0.7*r*math.cos(right_ang), cy + 0.7*r*math.sin(right_ang))])
-                screen.blit(flame_surf, (0, 0))
-        elif not assassin_invis and weapon == "bow":
-            bow_len = 60
-            arc_rect = pygame.Rect(player.centerx - 12, player.centery - bow_len, 24, bow_len*2)
-            bow_color = BLUE if isinstance(player_class, MadScientist) else BROWN
-            string_color = BLUE if isinstance(player_class, MadScientist) else BLACK
-            try:
-                pygame.draw.arc(screen, bow_color, arc_rect, math.radians(270), math.radians(90), 4)
-            except:
-                pass
-            top = (player.centerx + 4, player.centery - int(bow_len*0.9))
-            bottom = (player.centerx + 4, player.centery + int(bow_len*0.9))
-            pygame.draw.line(screen, string_color, top, bottom, 4)
-        elif not assassin_invis:
+        elif weapon == "bow":
+            # Flame Archer mastery slot 3: flamethrower (draw gun + cone when firing)
+            if isinstance(player_class, FlameArcher) and flame_mastery_unlocked and flame_archer_weapon == "flamethrower":
+                mx, my = pygame.mouse.get_pos()
+                ang = math.atan2(my - player.centery, mx - player.centerx)
+                gun_len = 50
+                tipx = int(player.centerx + gun_len * math.cos(ang))
+                tipy = int(player.centery + gun_len * math.sin(ang))
+                pygame.draw.line(screen, (200, 100, 0), (player.centerx, player.centery), (tipx, tipy), 5)
+                if flame_archer_flame_active:
+                    half = FLAME_THROWER_CONE_ANGLE_RAD / 2
+                    cx, cy = player.centerx, player.centery
+                    r = FLAME_THROWER_CONE_RANGE
+                    left_ang = ang - half
+                    right_ang = ang + half
+                    x1 = cx + r * math.cos(left_ang)
+                    y1 = cy + r * math.sin(left_ang)
+                    x2 = cx + r * math.cos(right_ang)
+                    y2 = cy + r * math.sin(right_ang)
+                    pts = [(cx, cy), (x1, y1), (x2, y2)]
+                    flame_surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+                    pygame.draw.polygon(flame_surf, (255, 140, 0, 140), pts)
+                    pygame.draw.polygon(flame_surf, (255, 200, 50, 90), [(cx, cy), (cx + 0.7*r*math.cos(left_ang), cy + 0.7*r*math.sin(left_ang)), (cx + 0.7*r*math.cos(right_ang), cy + 0.7*r*math.sin(right_ang))])
+                    screen.blit(flame_surf, (0, 0))
+            else:
+                # Mastery bow (Flame Archer with mastery unlocked): fancier, longer, amber glow
+                is_mastery_bow = isinstance(player_class, FlameArcher) and flame_mastery_unlocked
+                bow_len = 78 if is_mastery_bow else 60
+                arc_rect = pygame.Rect(player.centerx - (14 if is_mastery_bow else 12), player.centery - bow_len, 28 if is_mastery_bow else 24, bow_len*2)
+                if is_mastery_bow:
+                    bow_color = (255, 180, 60)
+                    bow_outer = (200, 100, 20)
+                    string_color = (255, 220, 100)
+                else:
+                    bow_color = BLUE if isinstance(player_class, MadScientist) else BROWN
+                    string_color = BLUE if isinstance(player_class, MadScientist) else BLACK
+                try:
+                    if is_mastery_bow:
+                        pygame.draw.arc(screen, bow_outer, arc_rect, math.radians(270), math.radians(90), 7)
+                        pygame.draw.arc(screen, bow_color, arc_rect, math.radians(270), math.radians(90), 5)
+                    else:
+                        pygame.draw.arc(screen, bow_color, arc_rect, math.radians(270), math.radians(90), 4)
+                except Exception:
+                    pass
+                top = (player.centerx + (5 if is_mastery_bow else 4), player.centery - int(bow_len*0.9))
+                bottom = (player.centerx + (5 if is_mastery_bow else 4), player.centery + int(bow_len*0.9))
+                pygame.draw.line(screen, string_color, top, bottom, 5 if is_mastery_bow else 4)
+        else:
+            # sword / melee (bow and Robber drawn above)
             mx,my = pygame.mouse.get_pos()
             ang = math.atan2(my - player.centery, mx - player.centerx)
             melee_range = Assassin.KNIFE_RANGE if isinstance(player_class, Assassin) else DEFAULTS["sword_range"]
@@ -6661,8 +6195,8 @@ def game_loop():
             tipy = player.centery + melee_range*math.sin(ang)
             pygame.draw.line(screen, (192,192,192), (player.centerx, player.centery), (tipx, tipy), 6 if isinstance(player_class, Assassin) else 8)
 
-        # spawn preview red X markers (offline only)
-        if (spawn_preview_active and (not online_mode)) or (online_mode and (now_ms - spawn_preview_start_ms < spawn_preview_ms)):
+        # spawn preview red X markers
+        if spawn_preview_active:
             preview_positions = spawn_pattern_positions[:int(enemies_per_wave)]
             for (rx, ry) in preview_positions:
                 size = 34
@@ -6723,6 +6257,15 @@ def game_loop():
             else:
                 ability_txt = FONT_MD.render("V: Fly ready", True, GREEN)
             screen.blit(ability_txt, (12, 84))
+        if isinstance(player_class, NoClass):
+            if now_ms < archer_dash_until_ms:
+                ability_txt = FONT_MD.render("Dashing!", True, CYAN)
+            elif now_ms < archer_dash_cooldown_until_ms:
+                sec = (archer_dash_cooldown_until_ms - now_ms) // 1000
+                ability_txt = FONT_MD.render(f"R dash: {sec}s", True, DARK_GRAY)
+            else:
+                ability_txt = FONT_MD.render("R: Dash ready", True, GREEN)
+            screen.blit(ability_txt, (12, 84))
         if isinstance(player_class, Assassin):
             if now_ms < assassin_invis_until_ms:
                 ability_txt = FONT_MD.render("Invisible!", True, PURPLE)
@@ -6731,6 +6274,9 @@ def game_loop():
                 ability_txt = FONT_MD.render(f"V invis: {sec}s", True, DARK_GRAY)
             else:
                 ability_txt = FONT_MD.render("V: Invis ready", True, GREEN)
+            screen.blit(ability_txt, (12, 84))
+        if isinstance(player_class, Hacker):
+            ability_txt = FONT_SM.render("Terminal commands below", True, HACKER_TEXT_READY)
             screen.blit(ability_txt, (12, 84))
         if isinstance(player_class, MadScientist):
             if now_ms < mad_scientist_overcharge_until_ms:
@@ -6741,10 +6287,13 @@ def game_loop():
             else:
                 ability_txt = FONT_MD.render("V: Overcharge ready", True, GREEN)
             screen.blit(ability_txt, (12, 84))
+        if isinstance(player_class, FlameArcher) and flame_mastery_unlocked:
+            ability_txt = FONT_SM.render(f"1:Bow  3:Flamethrower  F:Bomb  [{flame_archer_weapon}]", True, BLACK)
+            screen.blit(ability_txt, (12, 84))
         if isinstance(player_class, Robber):
-            gun_names = {"ak47": "AK-47", "minigun": "Minigun", "shotgun": "Shotgun", "flamethrower": "Flamethrower", "sniper": "Sniper"}
+            gun_names = {"ak47": "AK-47", "minigun": "Minigun", "shotgun": "Shotgun", "sniper": "Sniper"}
             g = robbers_gun
-            ability_txt = FONT_SM.render(f"1:AK-47  2:Minigun  3:Shotgun  4:Flame  5:Sniper  [{gun_names.get(g, g)}]", True, BLACK)
+            ability_txt = FONT_SM.render(f"1:AK-47  2:Minigun  3:Shotgun  4:Sniper  [{gun_names.get(g, g)}]", True, BLACK)
             screen.blit(ability_txt, (12, 84))
             if minigun_charge_start_ms and now_ms < minigun_charge_start_ms + ROBBER_MINIGUN_CHARGE_MS:
                 pct = min(100, int(100 * (now_ms - minigun_charge_start_ms) / ROBBER_MINIGUN_CHARGE_MS))
@@ -6766,17 +6315,26 @@ def game_loop():
                 screen.blit(charge_txt, (12, 108))
 
         # Hit List button (Assassin only)
-        hitlist_btn = pygame.Rect(WIDTH - 230, HEIGHT - 60, 100, 40)
-        save_btn = pygame.Rect(WIDTH - 120, HEIGHT - 60, 100, 40)
+        hud_bottom_y = HEIGHT - 56 - 40 - 10 if isinstance(player_class, Hacker) else HEIGHT - 60
+        hitlist_btn = pygame.Rect(WIDTH - 230, hud_bottom_y, 100, 40)
+        save_btn = pygame.Rect(WIDTH - 120, hud_bottom_y, 100, 40)
+        admin_btn = pygame.Rect(12, HEIGHT - 32, 52, 24)
         mx_hud, my_hud = pygame.mouse.get_pos()
         if isinstance(player_class, Assassin):
             draw_button(hitlist_btn, "Hit List", font=FONT_SM, hover=hitlist_btn.collidepoint(mx_hud, my_hud))
         draw_button(save_btn, "Save", font=FONT_SM, hover=save_btn.collidepoint(mx_hud, my_hud))
+        # Admin link (click to open panel instead of typing code)
+        admin_hover = admin_btn.collidepoint(mx_hud, my_hud)
+        admin_color = (180, 200, 180) if admin_hover else (120, 140, 120)
+        admin_surf = FONT_XS.render("Admin", True, admin_color)
+        screen.blit(admin_surf, (admin_btn.x, admin_btn.y + (admin_btn.h - admin_surf.get_height()) // 2))
 
         for e in enemies:
             if getattr(e, "is_boss", False):
                 draw_boss_bar(e)
                 break
+        if isinstance(player_class, Hacker):
+            draw_hacker_terminal(screen, now_ms)
         draw_hp_bar(player_hp)
         draw_exp_bar()
 
@@ -6787,31 +6345,6 @@ def game_loop():
 
 # ---------- ENTRY ----------
 if __name__ == "__main__":
-    # CLI name (client)
-    if "--name" in sys.argv:
-        try:
-            i = sys.argv.index("--name")
-            if i+1 < len(sys.argv):
-                ONLINE_USERNAME = sys.argv[i+1]
-        except:
-            pass
-
-    # server (e.g. DigitalOcean Droplet: set PORT=8765, open port in firewall, then python game.py --server)
-    if "--server" in sys.argv:
-        if not ONLINE_ENABLED:
-            print("Online is temporarily closed. Server start disabled.")
-            sys.exit(1)
-        if websockets is None:
-            print("websockets not installed. Run: python -m pip install websockets")
-            sys.exit(1)
-        host = os.environ.get("HOST", "0.0.0.0")
-        try:
-            port = int(os.environ.get("PORT", "8765"))
-        except ValueError:
-            port = 8765
-        asyncio.run(run_server(host, port, 20))
-        sys.exit(0)
-
     reset_game()
     while True:
         choice = main_menu()

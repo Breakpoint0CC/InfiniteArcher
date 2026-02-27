@@ -1,33 +1,62 @@
-You need these to run Infinite Archer
+# Infinite Archer
 
-Any platform
-Python3
-Pygame latest version recomended
-Websockets also latest version recomended
-
-How to get these requirements
-
-Python3:
-Windows: To install Python 3 on Windows, download the latest executable installer from python org
-MacOS: brew install python  in terminal
-
-Pygame:
-Windows: pip install pygame in terminal
-MacOS: pip3 install pygame  in terminal
-
-Websockets:
-
-Windows: pip install websockets  in terminal
-MacOS: pip install websockets  in terminal
+A single-player archery roguelike. Fight waves of enemies, level up, choose abilities, and unlock classes.
 
 ---
 
-Running the server (e.g. DigitalOcean Droplet)
+## Quick start
 
-1. On the droplet: install Python 3, then `pip install pygame websockets`. Copy your game files (at least game.py and requirements.txt if you use it).
-2. Open port 8765:
-   - DigitalOcean: Networking → Firewall → add inbound rule TCP 8765.
-   - On the server: `sudo ufw allow 8765` then `sudo ufw reload` (if using ufw).
-3. Start the server: `python game.py --server` (or `PORT=8766 python game.py --server` to use another port).
-4. On each client machine: set the server URL before launching the game, e.g. `IA_SERVER=ws://YOUR_DROPLET_IP:8765 python game.py`, or enter the URL in the game’s online menu.
-5. Optional: run in background with `nohup python game.py --server &` or use a process manager (systemd, screen, tmux).
+**You need:** Python 3 (3.11, 3.12, or 3.13) and pygame.
+
+**Run the game:**
+
+```bash
+python game.py
+```
+
+If pygame is missing, the game will try to set up a virtual environment and install it for you. When that finishes, run `python game.py` again.
+
+**Manual install (if the above doesn’t work):**
+
+```bash
+python3 -m venv venv
+source venv/bin/activate   # On Windows: venv\Scripts\activate
+pip install -r requirements.txt
+python game.py
+```
+
+---
+
+## How to play
+
+- **WASD** — Move
+- **Mouse** — Aim
+- **Left click** — Shoot (bow) or attack (sword)
+- **1** — Bow (default)
+- **2** — Sword
+- **Escape** — Pause
+
+**Class abilities (when unlocked):**
+
+- **No Class:** **R** — Dash (15 s cooldown)
+- **Vampire:** **V** — Fly
+- **Assassin:** **V** — Invisibility; **B** — Hit List
+- **Mad Scientist:** **V** — Overcharge
+- **Flame Archer:** **F** — Flame Bomb; **1** / **3** — Bow / Flamethrower
+- **Robber:** **1–4** — Switch guns
+- **Hacker:** Terminal at bottom of screen — click **Freeze All**, **Flame All**, **Fly Me**, **Invisible Me**, or **Teleport Me** (then click where to teleport)
+
+**Hacker class** is unlocked by opening the in-game admin panel (enter **6543** at the title screen, then type the code shown in the panel).
+
+---
+
+## Troubleshooting
+
+- **“No module named pygame”** — Install dependencies:  
+  `pip install -r requirements.txt`  
+  (Use the same Python that runs the game; if you use a venv, activate it first.)
+
+- **Python 3.14** — Pygame doesn’t support 3.14 yet. Install Python 3.13 (or 3.12/3.11) and use that to create your venv and run the game.
+
+- **Game won’t start** — Make sure you’re using Python 3.11, 3.12, or 3.13:  
+  `python --version` or `python3 --version`
