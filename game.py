@@ -5,7 +5,8 @@
 import os
 import sys
 
-import json, math, random, time, threading, asyncio
+import json, math, random, shutil, time, threading, asyncio
+from datetime import date
 import wave
 import io
 import base64
@@ -71,29 +72,114 @@ _ensure_dependencies()
 import pygame  # type: ignore[import-untyped]
 pygame.init()
 
+# ---------- DATA DIR (saves/settings live in app data, not cwd) ----------
+_data_dir_cached = None
+
+def _get_data_dir():
+    """Directory for saves and settings. When running from source, use script dir (so existing saves work).
+    When packaged (PyInstaller), use platform dir (e.g. ~/Library/Application Support/InfiniteArcher).
+    Never use the app bundle path when frozen (it may be read-only)."""
+    global _data_dir_cached
+    if _data_dir_cached is not None:
+        return _data_dir_cached
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    frozen = getattr(sys, "frozen", False) or getattr(sys, "_MEIPASS", None)
+    if frozen:
+        # Packaged app: must use a writable user dir, never the bundle (read-only)
+        try:
+            import platformdirs  # type: ignore[import-untyped]
+            d = platformdirs.user_data_dir("InfiniteArcher", "InfiniteArcher")
+        except Exception:
+            if sys.platform == "darwin":
+                d = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "InfiniteArcher")
+            elif sys.platform == "win32":
+                d = os.path.join(os.path.expanduser("~"), "AppData", "Local", "InfiniteArcher")
+            else:
+                d = os.path.join(os.path.expanduser("~"), ".local", "share", "InfiniteArcher")
+    else:
+        # Running from source: use script dir so saves stay in project and legacy saves are found
+        d = script_dir
+    os.makedirs(d, exist_ok=True)
+    _data_dir_cached = d
+    return d
+
+def _atomic_write_json(path, data):
+    """Write JSON atomically: temp file -> rename -> backup copy."""
+    dirpath = os.path.dirname(path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
+    tmp = path + ".tmp"
+    bak = path + ".bak"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+            f.flush()
+            if hasattr(os, "fsync"):
+                f.fsync()
+        if os.path.isfile(path):
+            try:
+                shutil.copy2(path, bak)
+            except Exception:
+                pass
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        raise
+
+def _load_json_with_backup(path):
+    """Load JSON; if corrupt, try .bak and recover."""
+    for p in (path, path + ".bak"):
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, "r") as f:
+                return json.load(f)
+        except Exception:
+            continue
+    return None
+
 # ---------- CONFIG ----------
 DEFAULT_WIDTH, DEFAULT_HEIGHT = 1280, 800
 SAVE_SLOTS = ["save1.json", "save2.json", "save3.json"]
 current_save_slot = 1  # 1..3
-SETTINGS_FILE = "settings.json"
 
-# Settings (volume, fullscreen); loaded on startup
+def get_settings_path():
+    return os.path.join(_get_data_dir(), "settings.json")
+
+# Settings (volume, fullscreen, hit_sounds, music, tutorial_completed, difficulty); loaded on startup
+DIFFICULTY_OPTIONS = ("Casual", "Normal", "Hard")
+
+def get_difficulty_count_mult():
+    """Multiplier for effective enemy count: Casual 0.85, Normal 1.0, Hard 1.25."""
+    d = settings.get("difficulty", "Normal")
+    if d == "Casual":
+        return 0.85
+    if d == "Hard":
+        return 1.25
+    return 1.0
+
 def load_settings():
-    out = {"volume": 0.7, "fullscreen": True}
-    try:
-        if os.path.isfile(SETTINGS_FILE):
-            with open(SETTINGS_FILE, "r") as f:
-                data = json.load(f)
-            out["volume"] = max(0, min(1, float(data.get("volume", 0.7))))
-            out["fullscreen"] = bool(data.get("fullscreen", True))
-    except Exception:
-        pass
+    out = {"volume": 0.7, "fullscreen": True, "hit_sounds": True, "music": True, "tutorial_completed": False, "difficulty": "Normal"}
+    path = get_settings_path()
+    data = _load_json_with_backup(path)
+    if data:
+        out["volume"] = max(0, min(1, float(data.get("volume", 0.7))))
+        out["fullscreen"] = bool(data.get("fullscreen", True))
+        out["hit_sounds"] = bool(data.get("hit_sounds", True))
+        out["music"] = bool(data.get("music", True))
+        out["tutorial_completed"] = bool(data.get("tutorial_completed", False))
+        out["difficulty"] = str(data.get("difficulty", "Normal")).strip() or "Normal"
+        if out["difficulty"] not in DIFFICULTY_OPTIONS:
+            out["difficulty"] = "Normal"
     return out
 
 def save_settings():
     try:
-        with open(SETTINGS_FILE, "w") as f:
-            json.dump(settings, f)
+        _atomic_write_json(get_settings_path(), settings)
     except Exception:
         pass
 
@@ -111,14 +197,14 @@ def apply_display_mode():
 def get_save_path(slot=None):
     s = current_save_slot if slot is None else int(slot)
     s = max(1, min(3, s))
-    return SAVE_SLOTS[s - 1]
+    return os.path.join(_get_data_dir(), SAVE_SLOTS[s - 1])
 
 def get_meta_path(slot=None):
     """Separate file per slot for gems + owned classes (persists across New Game)."""
     s = current_save_slot if slot is None else int(slot)
     s = max(1, min(3, s))
     base = os.path.splitext(SAVE_SLOTS[s - 1])[0]
-    return base + "_meta.json"
+    return os.path.join(_get_data_dir(), base + "_meta.json")
 
 # Display (from settings)
 apply_display_mode()
@@ -186,8 +272,80 @@ def _init_sounds():
 if _mixer_ok:
     _init_sounds()
 
+def _make_music_loop():
+    """Generate a short looping background track (calm, ambient) for menu/game. ~16s loop."""
+    sample_rate = 44100
+    duration_sec = 16.0
+    n_frames = int(sample_rate * duration_sec) * 2  # stereo
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        frames = []
+        # Simple ambient: slow minor progression (Am - Em - F - G), soft pad-like tones
+        for i in range(int(sample_rate * duration_sec)):
+            t = i / sample_rate
+            beat = t * 0.5  # 2 beats per 4 sec
+            chord = [
+                (220, 0.06), (261.63, 0.05), (329.63, 0.05),  # Am
+                (164.81, 0.06), (196, 0.05), (246.94, 0.05),   # Em
+                (174.61, 0.06), (220, 0.05), (261.63, 0.05),   # F
+                (196, 0.06), (246.94, 0.05), (293.66, 0.05),   # G
+            ][int(beat) % 12]
+            freq, vol = chord
+            s = int(32767 * vol * (0.6 * math.sin(2 * math.pi * freq * t) + 0.4 * math.sin(2 * math.pi * freq * 1.5 * t)))
+            s = max(-32768, min(32767, s))
+            frames.append(struct.pack("h", s))
+            frames.append(struct.pack("h", s))
+        w.writeframes(b"".join(frames))
+    return buf.getvalue()
+
+_music_sound = None
+_music_playing = False
+
+def start_background_music():
+    global _music_sound, _music_playing
+    if not _mixer_ok or not settings.get("music", True):
+        return
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        for name in ("music.ogg", "music.mp3", "music.wav"):
+            path = os.path.join(script_dir, name)
+            if os.path.isfile(path):
+                pygame.mixer.music.load(path)
+                pygame.mixer.music.set_volume(settings.get("volume", 0.7) * 0.5)
+                pygame.mixer.music.play(-1)
+                _music_sound = None
+                _music_playing = True
+                return
+        if _music_playing:
+            return
+        loop_buf = _make_music_loop()
+        _music_sound = pygame.mixer.Sound(buffer=io.BytesIO(loop_buf))
+        _music_sound.set_volume(settings.get("volume", 0.7) * 0.35)
+        _music_sound.play(loops=-1)
+        _music_playing = True
+    except Exception:
+        pass
+
+def stop_background_music():
+    global _music_sound, _music_playing
+    if not _mixer_ok:
+        return
+    try:
+        pygame.mixer.music.stop()
+        if _music_sound is not None:
+            _music_sound.stop()
+            _music_sound = None
+        _music_playing = False
+    except Exception:
+        pass
+
 def play_sound(name):
     if not _mixer_ok or name not in _sounds:
+        return
+    if name == "hit" and not settings.get("hit_sounds", True):
         return
     try:
         vol = settings.get("volume", 0.7)
@@ -299,11 +457,12 @@ UI_OVERLAY_DARK = (0, 0, 0, 180)
 UI_OVERLAY_PAUSE = (0, 0, 0, 160)
 
 def draw_button(rect, label, font=FONT_MD, hover=False, border_color=BLACK, text_color=UI_TEXT):
-    """Draw a consistent button; returns nothing. Caller handles click."""
+    """Draw a consistent button; returns nothing. Caller handles click. Text is truncated to fit rect."""
     bg = UI_BUTTON_HOVER if hover else UI_BUTTON_BG
     pygame.draw.rect(screen, bg, rect)
     pygame.draw.rect(screen, border_color, rect, 3)
-    txt = font.render(label, True, text_color)
+    label_fit = truncate_text_to_width(font, label, max(20, rect.w - 16))
+    txt = font.render(label_fit, True, text_color)
     screen.blit(txt, (rect.x + (rect.w - txt.get_width()) // 2, rect.y + (rect.h - txt.get_height()) // 2))
 
 def wrap_text_to_width(font, text, max_pixel_width):
@@ -327,6 +486,19 @@ def wrap_text_to_width(font, text, max_pixel_width):
     if current:
         lines.append(" ".join(current))
     return lines
+
+def truncate_text_to_width(font, text, max_pixel_width, ellipsis="…"):
+    """Return text truncated to fit max_pixel_width (with ellipsis if truncated)."""
+    if not text:
+        return ""
+    if font.render(text, True, BLACK).get_width() <= max_pixel_width:
+        return text
+    ellipsis_w = font.render(ellipsis, True, BLACK).get_width()
+    allow_w = max_pixel_width - ellipsis_w
+    for i in range(len(text), 0, -1):
+        if font.render(text[:i], True, BLACK).get_width() <= allow_w:
+            return text[:i] + ellipsis
+    return ellipsis
 
 # (Online/server code removed; add back later)
 
@@ -718,6 +890,78 @@ def grant_achievement(badge_name):
     if badge_name == HACKER_ACHIEVEMENT_BADGE:
         owned_classes.add("Hacker")
 
+# ---------- Daily Challenge ----------
+DAILY_REWARD_GEMS = 75
+DAILY_MIN_WAVE = 5
+
+def get_daily_date():
+    """Return YYYY-MM-DD for today (same for all players, deterministic daily challenge)."""
+    return date.today().isoformat()
+
+# Modifier presets: id, name, desc, and optional mults or grant_ability. Same day = same modifiers.
+DAILY_CHALLENGE_MODIFIERS = [
+    {"id": "glass_cannon", "name": "Glass Cannon", "desc": "2x damage, 50% max HP", "max_hp_mult": 0.5, "arrow_damage_mult": 2.0},
+    {"id": "tank", "name": "Tank", "desc": "2x HP, 70% damage", "max_hp_mult": 2.0, "arrow_damage_mult": 0.7},
+    {"id": "speed_demon", "name": "Speed Demon", "desc": "1.5x speed, 80% HP", "player_speed_mult": 1.5, "max_hp_mult": 0.8},
+    {"id": "onslaught", "name": "Onslaught", "desc": "1.4x enemies per wave", "enemies_per_wave_mult": 1.4},
+    {"id": "lucky", "name": "Lucky", "desc": "Start with Lucky", "grant_ability": "Lucky"},
+    {"id": "bounty_day", "name": "Bounty Day", "desc": "2x gem orbs", "gem_mult": 2.0},
+    {"id": "hard_mode", "name": "Hard Mode", "desc": "80% HP, 80% damage", "max_hp_mult": 0.8, "arrow_damage_mult": 0.8},
+    {"id": "berserker", "name": "Berserker", "desc": "1.3x damage, 70% HP", "max_hp_mult": 0.7, "arrow_damage_mult": 1.3},
+    {"id": "swarm", "name": "Swarm", "desc": "1.5x enemies", "enemies_per_wave_mult": 1.5},
+    {"id": "vitality", "name": "Vitality", "desc": "Start with Vitality", "grant_ability": "Vitality"},
+]
+
+def get_todays_daily_modifiers():
+    """Pick 1–2 modifiers deterministically from today's date."""
+    seed = hash(get_daily_date()) % (2 ** 32)
+    rng = random.Random(seed)
+    n = rng.randint(1, 2)
+    indices = rng.sample(range(len(DAILY_CHALLENGE_MODIFIERS)), min(n, len(DAILY_CHALLENGE_MODIFIERS)))
+    return [DAILY_CHALLENGE_MODIFIERS[i].copy() for i in indices]
+
+def apply_daily_modifiers():
+    """Apply current daily_modifiers to game globals. Call after reset_game()."""
+    global max_hp, player_hp, arrow_damage, player_speed, enemies_per_wave, owned_abilities
+    for m in daily_modifiers:
+        if m.get("max_hp_mult") is not None:
+            mult = m["max_hp_mult"]
+            max_hp = max(10, int(round(max_hp * mult)))
+            player_hp = min(player_hp, max_hp)
+        if m.get("arrow_damage_mult") is not None:
+            arrow_damage = max(1, int(round(arrow_damage * m["arrow_damage_mult"])))
+        if m.get("player_speed_mult") is not None:
+            player_speed = max(1.0, player_speed * m["player_speed_mult"])
+        if m.get("enemies_per_wave_mult") is not None:
+            enemies_per_wave = max(1, int(round(enemies_per_wave * m["enemies_per_wave_mult"])))
+        if m.get("grant_ability") is not None:
+            ab = m["grant_ability"]
+            if ab in owned_abilities:
+                owned_abilities[ab] = True
+
+def daily_gem_mult():
+    """Multiplier for gem orbs when a daily modifier has gem_mult (e.g. Bounty Day)."""
+    if not daily_challenge_active or not daily_modifiers:
+        return 1.0
+    mult = 1.0
+    for m in daily_modifiers:
+        if m.get("gem_mult") is not None:
+            mult *= m["gem_mult"]
+    return mult
+
+def try_grant_daily_reward():
+    """If this run was daily challenge and we reached min wave and haven't completed today, grant gems and save. Returns True if granted."""
+    global gems, daily_completed_date
+    if not daily_challenge_active or wave < DAILY_MIN_WAVE:
+        return False
+    today = get_daily_date()
+    if today == daily_completed_date:
+        return False
+    gems += DAILY_REWARD_GEMS
+    daily_completed_date = today
+    save_meta()
+    return True
+
 def class_rarity_label(cls_name):
     if cls_name == "Robber":
         return "Secret"
@@ -743,6 +987,11 @@ enemy_arrows = []
 enemies = []
 pending_orbs = []
 remote_arrows = []  # <-- friends arrows
+
+# Daily Challenge: one run per day with fixed modifiers; reward for reaching wave 5+
+daily_challenge_active = False
+daily_modifiers = []  # list of modifier dicts for current run
+daily_completed_date = ""  # YYYY-MM-DD last date we granted reward (per-slot, in meta)
 
 # Flame Archer Mastery: progress and unlock (persisted in save)
 flame_mastery_kills_burning = 0      # kills on enemies that were burning
@@ -796,9 +1045,9 @@ minigun_firing_until_ms = 0
 minigun_overheat_until_ms = 0
 minigun_last_bullet_ms = 0
 last_robber_sniper_ms = 0
-last_flame_archer_flame_tick_ms = 0   # Flame Archer mastery: flamethrower in slot 3
+last_flame_archer_flame_tick_ms = 0   # Flame Archer mastery: flamethrower in slot 2
 flame_archer_flame_active = False
-flame_archer_weapon = "bow"   # "bow" (slot 1) or "flamethrower" (slot 3)
+flame_archer_weapon = "bow"   # "bow" (slot 1) or "flamethrower" (slot 2)
 shotgun_shots_left = 5
 last_shotgun_shot_ms = 0
 shotgun_reload_until_ms = 0
@@ -1140,32 +1389,24 @@ slot_meta_cache = {1: {"gems":0,"player_class":"No Class"},
                    3: {"gems":0,"player_class":"No Class"}}
 
 def load_slot_meta(slot):
-    """Read meta for menu display."""
+    """Read meta for menu display. Uses backup recovery so corrupt files don't show 0 gems."""
     slot = int(slot)
     path = get_meta_path(slot)
-    if not os.path.exists(path):
+    data = _load_json_with_backup(path)
+    if not data:
         # Fallback: read from run save file if no meta file yet
         run_path = get_save_path(slot)
-        if os.path.exists(run_path):
-            try:
-                with open(run_path, "r") as f:
-                    data = json.load(f)
-                meta = {"gems": int(data.get("gems", 0)), "player_class": str(data.get("player_class", "No Class"))}
-                slot_meta_cache[slot] = meta
-                return meta
-            except Exception:
-                pass
-        slot_meta_cache[slot] = {"gems": 0, "player_class": "No Class"}
-        return slot_meta_cache[slot]
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-        meta = {"gems": int(data.get("gems", 0)), "player_class": str(data.get("player_class", "No Class"))}
+        data = _load_json_with_backup(run_path)
+    if data:
+        meta = {
+            "gems": int(data.get("gems", 0)),
+            "player_class": str(data.get("player_class", "No Class")),
+            "daily_completed_date": str(data.get("daily_completed_date", "")),
+        }
         slot_meta_cache[slot] = meta
         return meta
-    except Exception:
-        slot_meta_cache[slot] = {"gems": 0, "player_class": "No Class"}
-        return slot_meta_cache[slot]
+    slot_meta_cache[slot] = {"gems": 0, "player_class": "No Class", "daily_completed_date": ""}
+    return slot_meta_cache[slot]
 
 def refresh_all_slot_meta():
     for s in (1, 2, 3):
@@ -1186,11 +1427,18 @@ def confirm_popup(message, yes_text="Yes", no_text="No"):
         pygame.draw.rect(screen, UI_BORDER, panel, 4)
         mx, my = pygame.mouse.get_pos()
         lines = wrap_text_to_width(FONT_MD, message, panel_w - 48)
-        y = panel.y + 28
-        for line in lines:
+        line_h = FONT_MD.render("Ay", True, UI_TEXT).get_height() + 6
+        content_top = panel.y + 28
+        content_bottom = panel.bottom - btn_h - 36
+        max_visible = max(1, (content_bottom - content_top) // line_h)
+        y = content_top
+        for i, line in enumerate(lines[:max_visible]):
             t = FONT_MD.render(line, True, UI_TEXT)
             screen.blit(t, (panel.centerx - t.get_width()//2, y))
-            y += t.get_height() + 6
+            y += line_h
+        if len(lines) > max_visible:
+            t = FONT_SM.render("…", True, UI_TEXT_MUTED)
+            screen.blit(t, (panel.centerx - t.get_width()//2, y))
         draw_button(yes_rect, yes_text, hover=yes_rect.collidepoint(mx, my), text_color=UI_TEXT)
         draw_button(no_rect, no_text, hover=no_rect.collidepoint(mx, my), text_color=UI_TEXT)
         pygame.display.flip()
@@ -1220,19 +1468,22 @@ def delete_save_slot(slot):
                 os.remove(path)
             except Exception:
                 pass
-    slot_meta_cache[s] = {"gems": 0, "player_class": "No Class"}
+    slot_meta_cache[s] = {"gems": 0, "player_class": "No Class", "daily_completed_date": ""}
     refresh_all_slot_meta()
 
 def load_meta_into_game():
-    """Load gems, owned_classes, player_class, earned_achievements from current slot."""
-    global gems, owned_classes, player_class, earned_achievements
+    """Load gems, owned_classes, player_class, earned_achievements, daily_completed_date from current slot."""
+    global gems, owned_classes, player_class, earned_achievements, daily_completed_date
     path = get_meta_path()
-    if not os.path.exists(path):
+    data = _load_json_with_backup(path)
+    if not data:
+        # Fallback: read from run save so gems/classes persist when meta file wasn't written
+        data = _load_json_with_backup(get_save_path())
+    if not data:
         return
     try:
-        with open(path, "r") as f:
-            data = json.load(f)
         gems = int(data.get("gems", 0))
+        daily_completed_date = str(data.get("daily_completed_date", ""))
         raw_ach = data.get("earned_achievements", [])
         earned_achievements = set(x for x in raw_ach if isinstance(x, str))
         raw = data.get("owned_classes", [])
@@ -1254,82 +1505,97 @@ def load_meta_into_game():
     except Exception:
         pass
 
-def save_meta():
-    """Write current slot's meta (gems, owned_classes, player_class)."""
+def _write_meta_file():
+    """Write current slot's meta file (gems, owned_classes, player_class). Does not raise."""
     try:
         existing_classes = set()
-        if os.path.exists(get_meta_path()):
-            try:
-                with open(get_meta_path(), "r") as f:
-                    existing = json.load(f)
-                for c in existing.get("owned_classes", []):
-                    if isinstance(c, str) and c.strip():
-                        existing_classes.add(c.strip())
-            except Exception:
-                pass
+        existing = _load_json_with_backup(get_meta_path())
+        if existing:
+            for c in existing.get("owned_classes", []):
+                if isinstance(c, str) and c.strip():
+                    existing_classes.add(c.strip())
         merged = existing_classes | (owned_classes if owned_classes else {player_class.name})
         classes_to_save = list(merged)
-        data = {"gems": gems, "owned_classes": classes_to_save, "player_class": player_class.name, "earned_achievements": list(earned_achievements)}
-        with open(get_meta_path(), "w") as f:
-            json.dump(data, f)
+        data = {
+            "gems": gems,
+            "owned_classes": classes_to_save,
+            "player_class": player_class.name,
+            "earned_achievements": list(earned_achievements),
+            "daily_completed_date": daily_completed_date,
+        }
+        _atomic_write_json(get_meta_path(), data)
         load_slot_meta(current_save_slot)
     except Exception as e:
         print("Meta save failed:", e)
 
+def save_meta():
+    """Write current slot's meta (used by daily reward). Does not raise."""
+    _write_meta_file()
+
 # ---------- Save / Load ----------
 def save_game():
+    """Save run state and meta to current slot. Returns True if run save succeeded."""
     global owned_classes
+    # Ensure save directory exists
+    _get_data_dir()
+    classes_to_save = list(owned_classes) if owned_classes else [player_class.name]
+    run_data = {
+        "player": [player.x, player.y, player.width, player.height],
+        "player_hp": player_hp,
+        "max_hp": max_hp,
+        "arrow_damage": arrow_damage,
+        "player_exp": player_exp,
+        "player_level": player_level,
+        "exp_required": exp_required,
+        "wave": wave,
+        "score": score,
+        "gems": gems,
+        "pierce_level": pierce_level,
+        "knockback_level": knockback_level,
+        "owned_abilities": owned_abilities,
+        "owned_classes": classes_to_save,
+        "corrosive_level": corrosive_level,
+        "enemies_per_wave": enemies_per_wave,
+        "player_class": player_class.name,
+        "assassin_kills": assassin_kills,
+        "assassin_completed_bounties": list(assassin_completed_bounties),
+        "assassin_active_bounties": assassin_active_bounties,
+        "assassin_bounty_refresh_remaining_ms": max(0, assassin_bounty_refresh_at_ms - pygame.time.get_ticks()),
+        "flame_mastery_kills_burning": flame_mastery_kills_burning,
+        "flame_mastery_kills_dot_final": flame_mastery_kills_dot_final,
+        "flame_mastery_bosses_burning": flame_mastery_bosses_burning,
+        "flame_mastery_unlocked": flame_mastery_unlocked,
+        "earned_achievements": list(earned_achievements),
+        "daily_challenge_active": daily_challenge_active,
+        "daily_modifiers": daily_modifiers,
+    }
+    # 1. Write run save first so progress is never lost
+    run_ok = False
     try:
-        classes_to_save = list(owned_classes) if owned_classes else [player_class.name]
-        data = {
-            "player": [player.x, player.y, player.width, player.height],
-            "player_hp": player_hp,
-            "max_hp": max_hp,
-            "arrow_damage": arrow_damage,
-            "player_exp": player_exp,
-            "player_level": player_level,
-            "exp_required": exp_required,
-            "wave": wave,
-            "score": score,
-            "gems": gems,
-            "pierce_level": pierce_level,
-            "knockback_level": knockback_level,
-            "owned_abilities": owned_abilities,
-            "owned_classes": classes_to_save,
-            "corrosive_level": corrosive_level,
-            "enemies_per_wave": enemies_per_wave,
-            "player_class": player_class.name,
-            "assassin_kills": assassin_kills,
-            "assassin_completed_bounties": list(assassin_completed_bounties),
-            "assassin_active_bounties": assassin_active_bounties,
-            "assassin_bounty_refresh_remaining_ms": max(0, assassin_bounty_refresh_at_ms - pygame.time.get_ticks()),
-            "flame_mastery_kills_burning": flame_mastery_kills_burning,
-            "flame_mastery_kills_dot_final": flame_mastery_kills_dot_final,
-            "flame_mastery_bosses_burning": flame_mastery_bosses_burning,
-            "flame_mastery_unlocked": flame_mastery_unlocked,
-            "earned_achievements": list(earned_achievements),
-        }
-        with open(get_save_path(), "w") as f:
-            json.dump(data, f)
-        save_meta()
+        _atomic_write_json(get_save_path(), run_data)
+        run_ok = True
     except Exception as e:
-        print("Save failed:", e)
+        print("Save failed (run):", e)
+    # 2. Always write meta so gems/classes show in menu and persist for New Game
+    try:
+        _write_meta_file()
+    except Exception:
+        pass
+    return run_ok
 
 def load_game():
     global player_hp, max_hp, arrow_damage, player_exp, player_level, exp_required
     global wave, score, gems, pierce_level, knockback_level, owned_abilities, owned_classes, corrosive_level
-    global enemies_per_wave, player_class, earned_achievements
+    global enemies_per_wave, player_class, earned_achievements, weapon
     global vampire_fly_until_ms, vampire_fly_cooldown_until_ms
     global assassin_invis_until_ms, assassin_invis_cooldown_until_ms
     global assassin_kills, assassin_completed_bounties, assassin_active_bounties, assassin_bounty_refresh_at_ms
     global flame_mastery_kills_burning, flame_mastery_kills_dot_final, flame_mastery_bosses_burning, flame_mastery_unlocked
+    global daily_challenge_active, daily_modifiers
 
-    if not os.path.exists(get_save_path()):
-        return False
-    try:
-        with open(get_save_path(), "r") as f:
-            data = json.load(f)
-    except Exception:
+    path = get_save_path()
+    data = _load_json_with_backup(path)
+    if not data:
         return False
 
     try:
@@ -1411,6 +1677,10 @@ def load_game():
         flame_mastery_kills_dot_final = int(data.get("flame_mastery_kills_dot_final", 0))
         flame_mastery_bosses_burning = int(data.get("flame_mastery_bosses_burning", 0))
         flame_mastery_unlocked = bool(data.get("flame_mastery_unlocked", False))
+        daily_challenge_active = bool(data.get("daily_challenge_active", False))
+        daily_modifiers[:] = list(data.get("daily_modifiers", []))
+        if not isinstance(player_class, Knight):
+            weapon = "bow"
         return True
     except Exception as e:
         print("Load failed:", e)
@@ -1431,10 +1701,12 @@ def hit_list_menu():
         else:
             draw_text_centered(FONT_SM, "Refreshing next frame...", 110, (200, 204, 208))
         y = 160
+        hit_list_max_w = WIDTH - 80
         for slot in assassin_active_bounties:
             rwd = f"+{slot['reward'][1]} {slot['reward'][0].replace('_', ' ')}"
             line = f"{slot['name']} ({slot.get('progress', 0)}/{slot['count']}) → {rwd}"
-            txt = FONT_MD.render(line, True, WHITE)
+            line_fit = truncate_text_to_width(FONT_MD, line, hit_list_max_w)
+            txt = FONT_MD.render(line_fit, True, WHITE)
             screen.blit(txt, (WIDTH//2 - txt.get_width()//2, y))
             y += 48
         mx, my = pygame.mouse.get_pos()
@@ -1479,8 +1751,10 @@ def pause_menu():
                     return "resume"
                 if save_rect.collidepoint(ev.pos):
                     play_sound("menu_click")
-                    save_game()
-                    floating_texts.append({"x": center_x, "y": HEIGHT//2 + 120, "txt": "Saved!", "color": BLUE, "ttl": 100, "vy": -0.5, "alpha": 255})
+                    if save_game():
+                        floating_texts.append({"x": center_x, "y": HEIGHT//2 + 120, "txt": "Saved!", "color": BLUE, "ttl": 100, "vy": -0.5, "alpha": 255})
+                    else:
+                        floating_texts.append({"x": center_x, "y": HEIGHT//2 + 120, "txt": "Save failed", "color": RED, "ttl": 100, "vy": -0.5, "alpha": 255})
                 if quit_rect.collidepoint(ev.pos):
                     play_sound("menu_click")
                     return "quit"
@@ -1511,6 +1785,10 @@ def reset_game():
     global mad_scientist_overcharge_until_ms, mad_scientist_overcharge_cooldown_until_ms
     global flame_bomb_ball, flame_bomb_zone
     global flame_mastery_kills_burning, flame_mastery_kills_dot_final, flame_mastery_bosses_burning, flame_mastery_unlocked
+    global daily_challenge_active, daily_modifiers
+
+    daily_challenge_active = False
+    daily_modifiers = []
 
     size = DEFAULTS["player_size"]
     player = pygame.Rect(WIDTH//2 - size//2, HEIGHT//2 - size//2, size, size)
@@ -1617,9 +1895,17 @@ def reset_game():
 # ---------- Spawning ----------
 def spawn_wave_at_positions(positions):
     enemies.clear()
+    # Enemy mix shifts by wave: later waves get more fast/archer/tank
+    w = wave if wave >= 1 else 1
+    if w <= 5:
+        weights = [50, 30, 10, 10]
+    elif w <= 15:
+        weights = [40, 35, 12, 13]
+    else:
+        weights = [30, 35, 18, 17]
     for pos in positions:
-        etype = random.choices(["normal","fast","tank","archer"], weights=[50,30,10,10])[0]
-        rect = pygame.Rect(pos[0]-15, pos[1]-15, 30, 30)
+        etype = random.choices(["normal", "fast", "tank", "archer"], weights=weights)[0]
+        rect = pygame.Rect(pos[0] - 15, pos[1] - 15, 30, 30)
         enemies.append(Enemy(rect, etype))
 
 def spawn_wave(count):
@@ -2316,10 +2602,10 @@ CLASS_SHORT_DESC = {
     "Ranger": "Double shot",
     "Knight": "Deflect + armor",
     "Vampire": "Life steal + fly (V)",
-    "Assassin": "Invis + backstab knife (V)",
+    "Assassin": "Invis + Hit List (V, B)",
     "Hacker": "Terminal commands (achievement unlock)",
     "Mad Scientist": "Homing + splash, V: Overcharge",
-    "Robber": "5 guns (1–5), replaces bow",
+    "Robber": "4 guns (1–4), replaces bow",
 }
 
 # Embedded Flame Archer art (single file, no external image)
@@ -4889,7 +5175,7 @@ def flame_archer_mastery_panel():
         # Right: rewards then quest list
         rew_y = pic_y + 8
         screen.blit(FONT_SM.render("Rewards:", True, (255, 200, 80)), (right_x, rew_y))
-        rewards = ["Flame duration x2", "Flame Bomb (F)", "Flamethrower (slot 3)", "1.5x speed & damage in zone"]
+        rewards = ["Flame duration x2", "Flame Bomb (F)", "Flamethrower (slot 2)", "1.5x speed & damage in zone"]
         for i, r in enumerate(rewards):
             screen.blit(FONT_SM.render(r, True, (255, 200, 100)), (right_x, rew_y + 24 + i * 22))
         quest_y = rew_y + 24 + len(rewards) * 22 + 16
@@ -4921,21 +5207,32 @@ def flame_archer_mastery_panel():
 def class_shop_menu():
     global gems, player_class, owned_classes
     show_robber = False  # becomes True when player clicks on Gems (if gems >= 15000)
-    # Build list of classes to show (Robber only if revealed; Hacker only if achievement earned)
+    class_shop_tab = "gem"  # "gem" or "achievement"
+
     def visible_classes():
         out = []
         for cls in PLAYER_CLASS_ORDER:
-            if cls.name == "Robber":
-                if show_robber and gems >= ROBBER_MIN_GEMS_TO_SHOW:
+            cost = CLASS_COSTS.get(cls.name)
+            is_achievement_class = (cost is None)
+            if class_shop_tab == "achievement":
+                if not is_achievement_class:
+                    continue
+                if cls.name == "Hacker" and has_achievement(HACKER_ACHIEVEMENT_BADGE):
                     out.append(cls)
-            elif cls.name == "Hacker":
-                if has_achievement(HACKER_ACHIEVEMENT_BADGE):
-                    out.append(cls)
+                elif cls.name == "Hacker":
+                    out.append(cls)  # show locked too
             else:
-                out.append(cls)
+                if is_achievement_class:
+                    continue
+                if cls.name == "Robber":
+                    if show_robber and gems >= ROBBER_MIN_GEMS_TO_SHOW:
+                        out.append(cls)
+                else:
+                    out.append(cls)
         return out
+
     # Layout: fixed compact class boxes (don't grow on big screens)
-    area_top = 160
+    area_top = 200
     back_height = 72
     max_w = min(520, WIDTH - 80)
     gem_label_rect = None  # set each frame for click detection
@@ -4946,16 +5243,32 @@ def class_shop_menu():
         btn_h = row_h - 6
         y_start = area_top
         screen.fill(bg_color)
-        draw_text_centered(FONT_LG, "Class Shop", 60)
+        draw_text_centered(FONT_LG, "Class Shop", 50)
         gem_txt = f"Gems: {gems}"
         gem_surf = FONT_MD.render(gem_txt, True, BLUE)
         gem_x = WIDTH//2 - gem_surf.get_width()//2
-        gem_y = 118
+        gem_y = 100
         gem_label_rect = pygame.Rect(gem_x, gem_y - 4, gem_surf.get_width(), gem_surf.get_height() + 8)
         screen.blit(gem_surf, (gem_x, gem_y))
         if gems >= ROBBER_MIN_GEMS_TO_SHOW:
             hint = FONT_XS.render("(click gems to reveal secret class)", True, UI_TEXT_MUTED)
             screen.blit(hint, (WIDTH//2 - hint.get_width()//2, gem_y + 22))
+
+        # Tabs: Gem Classes | Achievement Classes
+        tab_h = 40
+        tab_y = 138
+        tab_w = 220
+        tab_gap = 12
+        gem_tab_rect = pygame.Rect(WIDTH//2 - tab_w - tab_gap//2, tab_y, tab_w, tab_h)
+        ach_tab_rect = pygame.Rect(WIDTH//2 + tab_gap//2, tab_y, tab_w, tab_h)
+        mx_cs, my_cs = pygame.mouse.get_pos()
+        for rect, label, key in [(gem_tab_rect, "Gem Classes", "gem"), (ach_tab_rect, "Achievement Classes", "achievement")]:
+            sel = (class_shop_tab == key)
+            fill = UI_BUTTON_HOVER if rect.collidepoint(mx_cs, my_cs) else (UI_PANEL_BG if sel else UI_BUTTON_BG)
+            pygame.draw.rect(screen, fill, rect)
+            pygame.draw.rect(screen, BLUE if sel else UI_BORDER, rect, 4 if sel else 2)
+            t = FONT_MD.render(label, True, UI_TEXT)
+            screen.blit(t, (rect.centerx - t.get_width()//2, rect.centery - t.get_height()//2 - 1))
 
         mx_cs, my_cs = pygame.mouse.get_pos()
         buttons = []
@@ -4985,10 +5298,14 @@ def class_shop_menu():
             else:
                 line1 = f"{cls.name} [{rarity}] — {cost} gems"
             line2 = CLASS_SHORT_DESC.get(cls.name, "")
-            t1 = FONT_MD.render(line1[:48] + ("…" if len(line1) > 48 else ""), True, UI_TEXT)
-            t2 = FONT_SM.render(line2, True, UI_TEXT_MUTED)
+            max_txt_w = max_w - (txt_x - rect.x) - 16
+            line1_fit = truncate_text_to_width(FONT_MD, line1, max_txt_w)
+            t1 = FONT_MD.render(line1_fit, True, UI_TEXT)
             screen.blit(t1, (txt_x, rect.y + 6))
-            screen.blit(t2, (txt_x, rect.y + 34))
+            line2_lines = wrap_text_to_width(FONT_SM, line2, max_txt_w)
+            for j, ln in enumerate(line2_lines[:2]):
+                t2 = FONT_SM.render(truncate_text_to_width(FONT_SM, ln, max_txt_w), True, UI_TEXT_MUTED)
+                screen.blit(t2, (txt_x, rect.y + 34 + j * 22))
             buttons.append((rect, cls, cost, selected, owned, mastery_rect))
 
         back_y = y_start + n_classes * row_h + 8
@@ -5002,38 +5319,46 @@ def class_shop_menu():
             if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
                 save_game(); return
             if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-                mx,my = ev.pos
-                if gem_label_rect and gem_label_rect.collidepoint(mx, my) and gems >= ROBBER_MIN_GEMS_TO_SHOW:
+                mx, my = ev.pos
+                if gem_tab_rect.collidepoint(mx, my):
+                    class_shop_tab = "gem"
+                    play_sound("menu_click")
+                elif ach_tab_rect.collidepoint(mx, my):
+                    class_shop_tab = "achievement"
+                    play_sound("menu_click")
+                elif gem_label_rect and gem_label_rect.collidepoint(mx, my) and gems >= ROBBER_MIN_GEMS_TO_SHOW:
                     show_robber = True
                     play_sound("menu_click")
-                for r, cls, cost, selected, owned, mastery_rect in buttons:
-                    if r.collidepoint(mx, my):
-                        play_sound("menu_click")
-                        # Flame Archer: bow icon opens mastery panel; rest of row = equip/buy
-                        if mastery_rect is not None and mastery_rect.collidepoint(mx, my):
-                            flame_archer_mastery_panel()
+                else:
+                    for r, cls, cost, selected, owned, mastery_rect in buttons:
+                        if r.collidepoint(mx, my):
+                            play_sound("menu_click")
+                            if mastery_rect is not None and mastery_rect.collidepoint(mx, my):
+                                flame_archer_mastery_panel()
+                                break
+                            if selected:
+                                return
+                            if owned:
+                                player_class = cls()
+                                save_game()
+                                notify_once(f"{cls.name} equipped!", 800)
+                                return
+                            if cost is None:
+                                continue
+                            if gems >= cost:
+                                gems -= cost
+                                owned_classes.add(cls.name)
+                                player_class = cls()
+                                save_game()
+                                notify_once(f"{cls.name} purchased!", 800)
+                                return
+                            else:
+                                notify_once("Not enough Gems!", 800)
                             break
-                        if selected:
-                            return
-                        if owned:
-                            player_class = cls()
-                            save_game()
-                            notify_once(f"{cls.name} equipped!", 800)
-                            return
-                        if cost is None:
-                            continue
-                        if gems >= cost:
-                            gems -= cost
-                            owned_classes.add(cls.name)
-                            player_class = cls()
-                            save_game()
-                            notify_once(f"{cls.name} purchased!", 800)
-                            return
-                        else:
-                            notify_once("Not enough Gems!", 800)
-                if back_rect.collidepoint(mx,my):
+                if back_rect.collidepoint(mx, my):
                     play_sound("menu_click")
-                    save_game(); return
+                    save_game()
+                    return
 
 # ---------- Lobby (stub; online removed) ----------
 def lobby_screen():
@@ -5239,8 +5564,9 @@ def admin_panel():
             pygame.draw.rect(screen, c, draw_rect)
             pygame.draw.rect(screen, (90, 150, 100), draw_rect, 3)
             font = FONT_XS if rect.w <= 72 else (FONT_SM if rect.w < 200 else FONT_MD)
-            w = font.size(label)[0]
-            screen.blit(font.render(label, True, (220, 240, 220)), (draw_rect.x + (draw_rect.w - w) // 2, draw_rect.y + (draw_rect.h - font.get_height()) // 2))
+            label_fit = truncate_text_to_width(font, label, max(8, rect.w - 8))
+            w = font.size(label_fit)[0]
+            screen.blit(font.render(label_fit, True, (220, 240, 220)), (draw_rect.x + (draw_rect.w - w) // 2, draw_rect.y + (draw_rect.h - font.get_height()) // 2))
         if max_scroll > 0:
             draw_text_centered(FONT_XS, "Scroll: mouse wheel", HEIGHT - 26, (120, 140, 120))
         pygame.display.flip()
@@ -5323,7 +5649,7 @@ def admin_panel():
 
 def settings_menu():
     global settings, screen, WIDTH, HEIGHT
-    panel_w, panel_h = 380, 260
+    panel_w, panel_h = 400, 380
     panel = pygame.Rect(WIDTH//2 - panel_w//2, HEIGHT//2 - panel_h//2, panel_w, panel_h)
     slider_w, slider_h = 280, 22
     slider_x = panel.centerx - slider_w//2
@@ -5331,6 +5657,9 @@ def settings_menu():
     dragging = None
     back_rect = pygame.Rect(panel.centerx - 90, panel.bottom - 54, 180, 44)
     fullscreen_rect = pygame.Rect(panel.centerx - 100, panel.y + 168, 200, 44)
+    hit_sounds_rect = pygame.Rect(panel.centerx + 80, panel.y + 218, 120, 44)
+    music_rect = pygame.Rect(panel.centerx + 80, panel.y + 268, 120, 44)
+    difficulty_rect = pygame.Rect(panel.centerx + 80, panel.y + 318, 120, 44)
     while True:
         screen.fill(bg_color)
         overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
@@ -5357,6 +5686,25 @@ def settings_menu():
         fs_text = "On" if settings.get("fullscreen", True) else "Off"
         fst = FONT_MD.render(fs_text, True, UI_TEXT)
         screen.blit(fst, (fullscreen_rect.x + (fullscreen_rect.w - fst.get_width()) // 2, fullscreen_rect.y + (fullscreen_rect.h - fst.get_height()) // 2 - 1))
+        hit_label = FONT_MD.render("Hit sounds", True, UI_TEXT)
+        screen.blit(hit_label, (hit_sounds_rect.x - 160, hit_sounds_rect.y - 24))
+        pygame.draw.rect(screen, UI_BUTTON_HOVER if hit_sounds_rect.collidepoint(mx, my) else UI_BUTTON_BG, hit_sounds_rect)
+        pygame.draw.rect(screen, UI_BORDER, hit_sounds_rect, 3)
+        hit_txt = "On" if settings.get("hit_sounds", True) else "Off"
+        screen.blit(FONT_MD.render(hit_txt, True, UI_TEXT), (hit_sounds_rect.x + (hit_sounds_rect.w - FONT_MD.size(hit_txt)[0]) // 2, hit_sounds_rect.y + (hit_sounds_rect.h - FONT_MD.size(hit_txt)[1]) // 2 - 1))
+        music_label = FONT_MD.render("Background music", True, UI_TEXT)
+        screen.blit(music_label, (music_rect.x - 180, music_rect.y - 24))
+        pygame.draw.rect(screen, UI_BUTTON_HOVER if music_rect.collidepoint(mx, my) else UI_BUTTON_BG, music_rect)
+        pygame.draw.rect(screen, UI_BORDER, music_rect, 3)
+        music_txt = "On" if settings.get("music", True) else "Off"
+        screen.blit(FONT_MD.render(music_txt, True, UI_TEXT), (music_rect.x + (music_rect.w - FONT_MD.size(music_txt)[0]) // 2, music_rect.y + (music_rect.h - FONT_MD.size(music_txt)[1]) // 2 - 1))
+        diff_label = FONT_MD.render("Difficulty", True, UI_TEXT)
+        screen.blit(diff_label, (difficulty_rect.x - 100, difficulty_rect.y - 24))
+        pygame.draw.rect(screen, UI_BUTTON_HOVER if difficulty_rect.collidepoint(mx, my) else UI_BUTTON_BG, difficulty_rect)
+        pygame.draw.rect(screen, UI_BORDER, difficulty_rect, 3)
+        diff_txt = settings.get("difficulty", "Normal")
+        dt_surf = FONT_MD.render(diff_txt, True, UI_TEXT)
+        screen.blit(dt_surf, (difficulty_rect.x + (difficulty_rect.w - dt_surf.get_width()) // 2, difficulty_rect.y + (difficulty_rect.h - dt_surf.get_height()) // 2 - 1))
         draw_button(back_rect, "Back", hover=back_rect.collidepoint(mx, my), text_color=UI_TEXT)
         pygame.display.flip()
 
@@ -5373,6 +5721,24 @@ def settings_menu():
                     settings["fullscreen"] = not settings.get("fullscreen", True)
                     apply_display_mode()
                     save_settings()
+                if hit_sounds_rect.collidepoint(mx, my):
+                    play_sound("menu_click")
+                    settings["hit_sounds"] = not settings.get("hit_sounds", True)
+                    save_settings()
+                if music_rect.collidepoint(mx, my):
+                    play_sound("menu_click")
+                    settings["music"] = not settings.get("music", True)
+                    save_settings()
+                    if settings.get("music", True):
+                        start_background_music()
+                    else:
+                        stop_background_music()
+                if difficulty_rect.collidepoint(mx, my):
+                    play_sound("menu_click")
+                    cur = settings.get("difficulty", "Normal")
+                    idx = DIFFICULTY_OPTIONS.index(cur) if cur in DIFFICULTY_OPTIONS else 1
+                    settings["difficulty"] = DIFFICULTY_OPTIONS[(idx + 1) % len(DIFFICULTY_OPTIONS)]
+                    save_settings()
                 if slider_x <= mx <= slider_x + slider_w and slider_y - 4 <= my <= slider_y + 32:
                     dragging = True
             if ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
@@ -5384,9 +5750,243 @@ def settings_menu():
                 save_settings()
         clock.tick(FPS)
 
+UPDATE_LOG_ENTRIES = [
+    "First-time tutorial (skippable)",
+    "Assassin Mastery — Coming Soon",
+    "Class Shop: Achievement Classes and Gem Classes tabs",
+    "Sword restricted to Knight class only",
+    "Flamethrower moved to Slot 2 (Flame Archer)",
+    "Flame Mastery: bow visuals fixed (normal bow shape)",
+    "Robber: 4 weapon slots (1–4) displayed correctly",
+    "Daily Challenge: dedicated page and reward UI",
+    "Settings: Hit sounds toggle, Background music",
+    "Update Log panel (main menu)",
+]
+
+def update_log_panel():
+    """Scrollable panel showing recent update entries."""
+    panel_w = min(520, WIDTH - 48)
+    panel_h = min(420, HEIGHT - 80)
+    panel = pygame.Rect(WIDTH//2 - panel_w//2, HEIGHT//2 - panel_h//2, panel_w, panel_h)
+    back_rect = pygame.Rect(panel.centerx - 70, panel.bottom - 48, 140, 40)
+    scroll_y = 0
+    line_h = 26
+    content_w = panel_w - 32
+    total_h = sum(len(wrap_text_to_width(FONT_SM, f"• {line}", content_w)) * line_h for line in UPDATE_LOG_ENTRIES)
+    max_scroll = max(0, total_h - (panel_h - 80))
+    while True:
+        screen.fill(bg_color)
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill(UI_OVERLAY_DARK)
+        screen.blit(overlay, (0, 0))
+        pygame.draw.rect(screen, UI_PANEL_BG, panel)
+        pygame.draw.rect(screen, UI_BORDER, panel, 4)
+        title = FONT_LG.render("Update Log", True, UI_TEXT)
+        screen.blit(title, (panel.centerx - title.get_width()//2, panel.y + 12))
+        mx, my = pygame.mouse.get_pos()
+        clip = pygame.Rect(panel.x + 12, panel.y + 52, panel.w - 24, panel_h - 100)
+        content_w = panel.w - 32
+        screen.set_clip(clip)
+        content_y = 0
+        for line in UPDATE_LOG_ENTRIES:
+            wrapped = wrap_text_to_width(FONT_SM, f"• {line}", content_w)
+            for ln in wrapped:
+                y = panel.y + 52 + content_y - scroll_y
+                if y + line_h >= panel.y + 52 and y <= panel.bottom - 52:
+                    txt = FONT_SM.render(ln, True, UI_TEXT)
+                    screen.blit(txt, (panel.x + 16, y))
+                content_y += line_h
+        screen.set_clip(None)
+        draw_button(back_rect, "Back", hover=back_rect.collidepoint(mx, my), text_color=UI_TEXT)
+        pygame.display.flip()
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                return
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                play_sound("menu_click")
+                return
+            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                if back_rect.collidepoint(ev.pos):
+                    play_sound("menu_click")
+                    return
+                if panel.collidepoint(ev.pos) and ev.pos[1] < panel.y + 52:
+                    pass
+                elif panel.collidepoint(ev.pos):
+                    pass
+            if ev.type == pygame.MOUSEWHEEL:
+                scroll_y = max(0, min(max_scroll, scroll_y - ev.y * 40))
+        clock.tick(FPS)
+
+def daily_challenge_page():
+    """Dedicated Daily Challenge screen: today's modifiers, reward, Start / Back. Returns 'start' to begin run, None for back."""
+    today_mods = get_todays_daily_modifiers()
+    today_str = get_daily_date()
+    completed = load_slot_meta(current_save_slot).get("daily_completed_date") == today_str
+
+    # Layout
+    pad = 24
+    title_y = HEIGHT // 8
+    panel_w = min(520, WIDTH - 48)
+    panel_x = (WIDTH - panel_w) // 2
+    mod_card_h = 56
+    mod_gap = 10
+    reward_y = 0  # set after modifiers
+    btn_w, btn_h = 200, 52
+    back_rect = pygame.Rect(panel_x, 0, btn_w, btn_h)  # set y later
+    start_rect = pygame.Rect(WIDTH - panel_x - btn_w, 0, btn_w, btn_h)
+
+    while True:
+        screen.fill(bg_color)
+        mx, my = pygame.mouse.get_pos()
+
+        # Title
+        draw_text_centered(FONT_LG, "Daily Challenge", title_y, (180, 100, 20), y_is_center=False)
+        date_label = date.today().strftime("%A, %B %d")
+        draw_text_centered(FONT_SM, date_label, title_y + 52, UI_TEXT_MUTED, y_is_center=False)
+
+        # Modifiers panel
+        mod_start_y = title_y + 100
+        mod_title = FONT_MD.render("Today's modifiers", True, UI_TEXT)
+        screen.blit(mod_title, (panel_x, mod_start_y - 32))
+        for i, m in enumerate(today_mods):
+            card_y = mod_start_y + i * (mod_card_h + mod_gap)
+            card = pygame.Rect(panel_x, card_y, panel_w, mod_card_h)
+            pygame.draw.rect(screen, UI_PANEL_BG, card)
+            pygame.draw.rect(screen, (220, 160, 60), card, 3)
+            card_text_w = panel_w - 32
+            name_fit = truncate_text_to_width(FONT_MD, m.get("name", "?"), card_text_w)
+            name_txt = FONT_MD.render(name_fit, True, (140, 90, 20))
+            screen.blit(name_txt, (card.x + 16, card.y + 8))
+            desc_lines = wrap_text_to_width(FONT_SM, m.get("desc", ""), card_text_w)
+            for j, ln in enumerate(desc_lines[:2]):
+                screen.blit(FONT_SM.render(ln, True, UI_TEXT_MUTED), (card.x + 16, card.y + 32 + j * 20))
+
+        reward_y = mod_start_y + len(today_mods) * (mod_card_h + mod_gap) + 36
+
+        # Reward panel (prominent)
+        reward_h = 88
+        reward_rect = pygame.Rect(panel_x, reward_y, panel_w, reward_h)
+        reward_bg = (255, 248, 220)
+        pygame.draw.rect(screen, reward_bg, reward_rect)
+        pygame.draw.rect(screen, (200, 140, 40), reward_rect, 4)
+        reward_title = FONT_MD.render("Reward", True, (120, 70, 10))
+        screen.blit(reward_title, (reward_rect.x + 20, reward_rect.y + 12))
+        reward_text_w = panel_w - 40
+        if completed:
+            done_str = "Completed today — come back tomorrow!"
+            done_fit = truncate_text_to_width(FONT_MD, done_str, reward_text_w)
+            screen.blit(FONT_MD.render(done_fit, True, (60, 120, 60)), (reward_rect.x + 20, reward_rect.y + 44))
+        else:
+            reward_str = f"Reach wave {DAILY_MIN_WAVE}  →  +{DAILY_REWARD_GEMS} gems"
+            reward_fit = truncate_text_to_width(FONT_MD, reward_str, reward_text_w)
+            screen.blit(FONT_MD.render(reward_fit, True, (80, 50, 10)), (reward_rect.x + 20, reward_rect.y + 40))
+            hint_fit = truncate_text_to_width(FONT_XS, "(Once per day, saved to current slot)", reward_text_w)
+            screen.blit(FONT_XS.render(hint_fit, True, UI_TEXT_MUTED), (reward_rect.x + 20, reward_rect.y + 66))
+
+        # Buttons
+        btn_y = reward_rect.bottom + 32
+        back_rect.y = btn_y
+        start_rect.y = btn_y
+        draw_button(back_rect, "Back", hover=back_rect.collidepoint(mx, my), border_color=UI_BORDER, text_color=UI_TEXT)
+        start_hover = start_rect.collidepoint(mx, my)
+        if not completed:
+            draw_button(start_rect, "Start Challenge", hover=start_hover, border_color=(180, 100, 20), text_color=(80, 40, 0))
+        else:
+            pygame.draw.rect(screen, UI_BUTTON_BG, start_rect)
+            pygame.draw.rect(screen, UI_BORDER_LIGHT, start_rect, 3)
+            start_txt = FONT_MD.render("Already done", True, UI_TEXT_MUTED)
+            screen.blit(start_txt, (start_rect.x + (start_rect.w - start_txt.get_width()) // 2, start_rect.y + (start_rect.h - start_txt.get_height()) // 2 - 1))
+
+        pygame.display.flip()
+
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                play_sound("menu_click")
+                return None
+            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                if back_rect.collidepoint(ev.pos):
+                    play_sound("menu_click")
+                    return None
+                if not completed and start_rect.collidepoint(ev.pos):
+                    play_sound("menu_click")
+                    return "start"
+        clock.tick(FPS)
+
+def tutorial_screen():
+    """First-time tutorial: a few slides, then set tutorial_completed and return."""
+    global settings
+    slides = [
+        ("Welcome to Infinite Archer", "You're an archer fighting endless waves of enemies. Move, aim, and shoot to survive. Collect gems and orbs to level up and unlock new classes."),
+        ("Movement & Aim", "WASD — Move your character.\n\nMouse — Aim your bow.\n\nThe red shapes are enemies. Don't let them touch you!"),
+        ("Combat", "Left click — Shoot an arrow (or attack with sword as Knight).\n\n1 — Bow (default).\n2 — Sword (Knight only) or Flamethrower (Flame Archer).\n\nKill enemies to spawn orbs. Collect orbs before they expire to gain EXP and gems."),
+        ("Survive & Grow", "Escape — Pause game.\n\nBetween waves you'll level up and choose upgrades. Reach higher waves for more rewards. Buy new classes in the Classes menu with gems.\n\nGood luck!"),
+    ]
+    idx = 0
+    panel_w = min(560, WIDTH - 48)
+    panel_h = min(440, HEIGHT - 60)
+    panel = pygame.Rect(WIDTH//2 - panel_w//2, HEIGHT//2 - panel_h//2, panel_w, panel_h)
+    content_w = panel_w - 48
+    next_rect = pygame.Rect(panel.right - 130, panel.bottom - 52, 110, 44)
+    skip_rect = pygame.Rect(panel.x + 20, panel.bottom - 52, 80, 44)
+    while True:
+        screen.fill(bg_color)
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 140))
+        screen.blit(overlay, (0, 0))
+        pygame.draw.rect(screen, UI_PANEL_BG, panel)
+        pygame.draw.rect(screen, UI_BORDER, panel, 4)
+        mx, my = pygame.mouse.get_pos()
+        title, body = slides[idx]
+        title_fit = truncate_text_to_width(FONT_LG, title, panel_w - 24)
+        title_surf = FONT_LG.render(title_fit, True, UI_TEXT)
+        screen.blit(title_surf, (panel.centerx - title_surf.get_width()//2, panel.y + 20))
+        y = panel.y + 78
+        for para in body.split("\n\n"):
+            lines = wrap_text_to_width(FONT_SM, para, content_w)
+            for line in lines:
+                t = FONT_SM.render(line, True, UI_TEXT if not line.startswith("—") else UI_TEXT_MUTED)
+                screen.blit(t, (panel.x + 24, y))
+                y += 26
+            y += 10
+        if idx < len(slides) - 1:
+            draw_button(next_rect, "Next", hover=next_rect.collidepoint(mx, my), text_color=UI_TEXT)
+            draw_button(skip_rect, "Skip", font=FONT_SM, hover=skip_rect.collidepoint(mx, my), text_color=UI_TEXT_MUTED)
+        else:
+            next_rect = pygame.Rect(panel.centerx - 55, panel.bottom - 52, 110, 44)
+            draw_button(next_rect, "Got it!", hover=next_rect.collidepoint(mx, my), text_color=UI_TEXT)
+        pygame.display.flip()
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                settings["tutorial_completed"] = True
+                save_settings()
+                return
+            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                if next_rect.collidepoint(ev.pos):
+                    play_sound("menu_click")
+                    if idx >= len(slides) - 1:
+                        settings["tutorial_completed"] = True
+                        save_settings()
+                        return
+                    idx += 1
+                    if idx < len(slides) - 1:
+                        next_rect = pygame.Rect(panel.right - 130, panel.bottom - 52, 110, 44)
+                elif idx < len(slides) - 1 and skip_rect.collidepoint(ev.pos):
+                    play_sound("menu_click")
+                    settings["tutorial_completed"] = True
+                    save_settings()
+                    return
+        clock.tick(FPS)
+
 def main_menu():
-    global current_save_slot
+    global current_save_slot, daily_challenge_active, daily_modifiers
     refresh_all_slot_meta()
+    start_background_music()
 
     while True:
         screen.fill(bg_color)
@@ -5399,10 +5999,11 @@ def main_menu():
         btn_w, btn_h = 360, 70
         new_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 - 140, btn_w, btn_h)
         resume_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 - 40, btn_w, btn_h)
-        quit_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 + 60, btn_w, btn_h)
-        class_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 + 160, btn_w, btn_h)
+        daily_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 + 60, btn_w, btn_h)
+        quit_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 + 160, btn_w, btn_h)
+        class_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 + 260, btn_w, btn_h)
 
-        for rect, label in [(new_rect, "Create New Game"), (resume_rect, "Resume Game"), (quit_rect, "Quit")]:
+        for rect, label in [(new_rect, "Create New Game"), (resume_rect, "Resume Game"), (daily_rect, "Daily Challenge"), (quit_rect, "Quit")]:
             draw_button(rect, label, hover=rect.collidepoint(mx, my))
         draw_button(class_rect, "Classes", hover=class_rect.collidepoint(mx, my))
 
@@ -5413,6 +6014,8 @@ def main_menu():
 
         settings_rect = pygame.Rect(16, 14, 100, 36)
         draw_button(settings_rect, "Settings", font=FONT_SM, hover=settings_rect.collidepoint(mx, my))
+        update_log_rect = pygame.Rect(16, 54, 100, 36)
+        draw_button(update_log_rect, "Update Log", font=FONT_SM, hover=update_log_rect.collidepoint(mx, my))
 
         slot_y = HEIGHT//2 + 360
         slot_w, slot_h = 180, 60
@@ -5476,6 +6079,15 @@ def main_menu():
                         return "resume"
                     notify_once("No save found — starting new", 900)
                     return "new"
+                if daily_rect.collidepoint(ev.pos):
+                    play_sound("menu_click")
+                    result = daily_challenge_page()
+                    if result == "start":
+                        reset_game()
+                        daily_challenge_active = True
+                        daily_modifiers[:] = get_todays_daily_modifiers()
+                        apply_daily_modifiers()
+                        return "new"
                 if class_rect.collidepoint(ev.pos):
                     play_sound("menu_click")
                     reset_game()
@@ -5484,6 +6096,10 @@ def main_menu():
                 if settings_rect.collidepoint(ev.pos):
                     play_sound("menu_click")
                     settings_menu()
+                    continue
+                if update_log_rect.collidepoint(ev.pos):
+                    play_sound("menu_click")
+                    update_log_panel()
                     continue
                 if quit_rect.collidepoint(ev.pos):
                     play_sound("menu_click")
@@ -5494,7 +6110,7 @@ def main_menu():
 
         clock.tick(FPS)
 
-def game_over_screen():
+def game_over_screen(daily_granted=False):
     while True:
         screen.fill(bg_color)
         overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
@@ -5502,9 +6118,26 @@ def game_over_screen():
         screen.blit(overlay, (0, 0))
         draw_text_centered(FONT_LG, "Game Over", HEIGHT//2 - 120, (220, 60, 60), y_is_center=True)
         stats = f"Wave: {wave}  •  Score: {score}  •  Gems this run: {gems_this_run}"
-        stats_font = FONT_MD if FONT_MD.render(stats, True, BLACK).get_width() <= WIDTH - 40 else FONT_SM
-        draw_text_centered(stats_font, stats, HEIGHT//2 - 50, (240, 244, 248), y_is_center=True)
-        draw_text_centered(FONT_SM, "Click or press Enter to return to menu", HEIGHT//2 + 20, UI_TEXT_MUTED, y_is_center=True)
+        stats_max_w = WIDTH - 40
+        stats_lines = wrap_text_to_width(FONT_MD, stats, stats_max_w)
+        if not stats_lines:
+            stats_lines = [stats[:50]]
+        stats_font = FONT_MD if FONT_MD.render(stats_lines[0], True, BLACK).get_width() <= stats_max_w else FONT_SM
+        stats_lines = wrap_text_to_width(stats_font, stats, stats_max_w) if stats_lines else [stats]
+        stats_y = HEIGHT//2 - 50 - (len(stats_lines) - 1) * (stats_font.get_height() + 4) // 2
+        for i, ln in enumerate(stats_lines):
+            draw_text_centered(stats_font, ln, stats_y + i * (stats_font.get_height() + 4), (240, 244, 248), y_is_center=True)
+        if daily_granted:
+            rw, rh = 320, 52
+            reward_box = pygame.Rect(WIDTH//2 - rw//2, HEIGHT//2 + 4, rw, rh)
+            pygame.draw.rect(screen, (255, 248, 220), reward_box)
+            pygame.draw.rect(screen, (200, 140, 40), reward_box, 3)
+            reward_str = f"Daily reward: +{DAILY_REWARD_GEMS} gems saved!"
+            reward_fit = truncate_text_to_width(FONT_MD, reward_str, rw - 24)
+            reward_msg = FONT_MD.render(reward_fit, True, (100, 60, 10))
+            screen.blit(reward_msg, (reward_box.centerx - reward_msg.get_width()//2, reward_box.centery - reward_msg.get_height()//2 - 1))
+        prompt_y = HEIGHT//2 + (72 if daily_granted else 20)
+        draw_text_centered(FONT_SM, "Click or press Enter to return to menu", prompt_y, UI_TEXT_MUTED, y_is_center=True)
         pygame.display.flip()
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
@@ -5534,6 +6167,8 @@ def game_loop():
 
     gems_this_run = 0
     player.center = (WIDTH//2, HEIGHT//2)
+    if not isinstance(player_class, Knight):
+        weapon = "bow"
 
     spawn_preview_active = True
     spawn_preview_start_ms = pygame.time.get_ticks()
@@ -5619,8 +6254,10 @@ def game_loop():
                 if ev.key == pygame.K_2:
                     if isinstance(player_class, Robber):
                         robbers_gun = "minigun"
-                    else:
+                    elif isinstance(player_class, Knight):
                         weapon = "sword"
+                    elif isinstance(player_class, FlameArcher) and flame_mastery_unlocked:
+                        flame_archer_weapon = "flamethrower"
                 if isinstance(player_class, Robber):
                     if ev.key == pygame.K_3: robbers_gun = "shotgun"
                     if ev.key == pygame.K_4: robbers_gun = "sniper"
@@ -5686,16 +6323,17 @@ def game_loop():
                             "vx": FLAME_BOMB_BALL_SPEED * dx / d, "vy": FLAME_BOMB_BALL_SPEED * dy / d,
                         }
                     continue
-                # Flame Archer mastery: 1 = bow, 3 = flamethrower
+                # Flame Archer mastery: 1 = bow, 2 = flamethrower
                 if ev.key == pygame.K_1 and isinstance(player_class, FlameArcher) and flame_mastery_unlocked:
                     flame_archer_weapon = "bow"
-                if ev.key == pygame.K_3 and isinstance(player_class, FlameArcher) and flame_mastery_unlocked:
+                if ev.key == pygame.K_2 and isinstance(player_class, FlameArcher) and flame_mastery_unlocked:
                     flame_archer_weapon = "flamethrower"
                 if in_collection_phase and ev.key == pygame.K_SPACE:
                     for orb in pending_orbs[:]:
                         player_exp += orb["amount"]
-                        gems += orb["amount"]
-                        gems_this_run += orb["amount"]
+                        amt = max(1, int(round(orb["amount"] * daily_gem_mult())))
+                        gems += amt
+                        gems_this_run += amt
                         if owned_abilities.get("Bounty", False) and random.random() < 0.25:
                             gems += 1
                             gems_this_run += 1
@@ -5728,8 +6366,10 @@ def game_loop():
                 save_btn_y = HEIGHT - 56 - 40 - 10 if isinstance(player_class, Hacker) else HEIGHT - 60
                 save_btn = pygame.Rect(WIDTH - 120, save_btn_y, 100, 40)
                 if save_btn.collidepoint(mx,my):
-                    save_game()
-                    floating_texts.append({"x":save_btn.centerx,"y":save_btn.top-10,"txt":"Saved!","color":BLUE,"ttl":45,"vy":-0.6,"alpha":255})
+                    if save_game():
+                        floating_texts.append({"x":save_btn.centerx,"y":save_btn.top-10,"txt":"Saved!","color":BLUE,"ttl":45,"vy":-0.6,"alpha":255})
+                    else:
+                        floating_texts.append({"x":save_btn.centerx,"y":save_btn.top-10,"txt":"Save failed","color":RED,"ttl":45,"vy":-0.6,"alpha":255})
                     continue
                 # Admin (click text at bottom to open panel instead of typing code)
                 admin_btn = pygame.Rect(12, HEIGHT - 32, 52, 24)
@@ -5749,8 +6389,9 @@ def game_loop():
                         rect = pygame.Rect(orb["x"]-8, orb["y"]-8, 16, 16)
                         if rect.collidepoint(mx,my):
                             player_exp += orb["amount"]
-                            gems += orb["amount"]
-                            gems_this_run += orb["amount"]
+                            amt = max(1, int(round(orb["amount"] * daily_gem_mult())))
+                            gems += amt
+                            gems_this_run += amt
                             if owned_abilities.get("Bounty", False) and random.random() < 0.25:
                                 gems += 1
                                 gems_this_run += 1
@@ -5767,7 +6408,7 @@ def game_loop():
                     # Flame Archer with flamethrower selected: don't shoot bow (hold fires flamethrower in update)
                     if not (isinstance(player_class, FlameArcher) and flame_mastery_unlocked and flame_archer_weapon == "flamethrower"):
                         shoot_bow(mx,my)
-                else:
+                elif isinstance(player_class, Knight) and weapon == "sword":
                     handle_sword_attack(mx,my)
 
         # Flame Bomb: update ball position; update zone ttl and apply burn to enemies in zone
@@ -5873,7 +6514,7 @@ def game_loop():
             if wave % 20 == 0:
                 spawn_boss()
             else:
-                spawn_wave(enemies_per_wave)
+                spawn_wave(max(1, int(round(enemies_per_wave * get_difficulty_count_mult()))))
 
         # update arrows
         for a in arrows[:]:
@@ -5900,7 +6541,9 @@ def game_loop():
                 radius = CORROSIVE_BASE_RADIUS * (0.6 + 0.08 * min(corrosive_level, 5))
                 dmg = max(1, int(CORROSIVE_DPS * 0.5 * min(corrosive_level, 5)))
                 cx, cy = player.centerx, player.centery
-                for enemy in enemies[:]:
+                i = len(enemies) - 1
+                while i >= 0:
+                    enemy = enemies[i]
                     ex, ey = enemy.rect.centerx, enemy.rect.centery
                     if math.hypot(ex - cx, ey - cy) <= radius:
                         enemy.hp -= dmg
@@ -5909,12 +6552,14 @@ def game_loop():
                             record_assassin_kill(enemy)
                             score += 1
                             spawn_orb(enemy.rect.centerx, enemy.rect.centery, amount=1)
-                            try: enemies.remove(enemy)
-                            except: pass
+                            del enemies[i]
+                    i -= 1
 
-        # enemies update
-        for enemy in enemies[:]:
-            if getattr(enemy,"is_boss",False):
+        # enemies update (reverse index iteration so we can delete without list copy)
+        i = len(enemies) - 1
+        while i >= 0:
+            enemy = enemies[i]
+            if getattr(enemy, "is_boss", False):
                 boss_try_summon(enemy)
                 boss_try_shoot(enemy)
                 boss_try_slam(enemy, assassin_invis)
@@ -5937,56 +6582,71 @@ def game_loop():
                 record_assassin_kill(enemy)
                 score += 1
                 spawn_orb(enemy.rect.centerx, enemy.rect.centery, amount=1)
-                try: enemies.remove(enemy)
-                except: pass
+                del enemies[i]
+                i -= 1
                 continue
 
             if player.colliderect(enemy.rect):
                 if not vampire_fly and not assassin_invis:
                     dmg = enemy.damage
                     if isinstance(player_class, Knight):
-                        dmg = int(math.ceil(dmg*0.90))
+                        dmg = int(math.ceil(dmg * 0.90))
                     if not admin_god_mode:
                         player_hp -= dmg
-                    try: enemies.remove(enemy)
-                    except: pass
+                    del enemies[i]
                     if not admin_god_mode and player_hp <= 0:
                         play_sound("death")
-                        game_over_screen(); reset_game(); return
+                        daily_granted = try_grant_daily_reward()
+                        game_over_screen(daily_granted=daily_granted)
+                        reset_game()
+                        return
+            i -= 1
 
-        # enemy arrows hit player (only Assassin invis blocks; Vampire fly = archers can hit)
-        for ea in enemy_arrows[:]:
+        # enemy arrows hit player (reverse index so we can delete without list copy)
+        j = len(enemy_arrows) - 1
+        while j >= 0:
+            ea = enemy_arrows[j]
             if player.colliderect(ea.rect) and not assassin_invis:
                 if isinstance(player_class, Knight) and weapon == "sword":
                     if player_class.try_deflect(ea):
+                        j -= 1
                         continue
                 dmg = ea.damage
                 if isinstance(player_class, Knight):
-                    dmg = int(math.ceil(dmg*0.90))
+                    dmg = int(math.ceil(dmg * 0.90))
                 if not admin_god_mode:
                     player_hp -= dmg
-                try: enemy_arrows.remove(ea)
-                except: pass
+                del enemy_arrows[j]
                 if not admin_god_mode and player_hp <= 0:
                     play_sound("death")
-                    game_over_screen(); reset_game(); return
+                    daily_granted = try_grant_daily_reward()
+                    game_over_screen(daily_granted=daily_granted)
+                    reset_game()
+                    return
             elif player.colliderect(ea.rect) and assassin_invis:
-                try: enemy_arrows.remove(ea)
-                except: pass
+                del enemy_arrows[j]
+            j -= 1
 
-        # player arrows hit enemies
-        for a in arrows[:]:
-            for enemy in enemies[:]:
-                if enemy.rect.colliderect(a.rect):
-                    dmg_override = getattr(a, "damage_override", None)
-                    hit_dmg = dmg_override if dmg_override is not None else arrow_damage
-                    handle_arrow_hit(enemy, hit_dmg)
-                    if getattr(a,"pierce_remaining",0) > 0:
-                        a.pierce_remaining -= 1
-                    else:
-                        try: arrows.remove(a)
-                        except: pass
-                    break
+        # player arrows hit enemies (use collidelist to avoid O(arrows*enemies) Python loop)
+        arrows_snapshot = list(arrows)
+        for a in arrows_snapshot:
+            if a not in arrows:
+                continue
+            enemy_rects = [e.rect for e in enemies]
+            idx = a.rect.collidelist(enemy_rects)
+            if idx >= 0:
+                enemy = enemies[idx]
+                dmg_override = getattr(a, "damage_override", None)
+                hit_dmg = dmg_override if dmg_override is not None else arrow_damage
+                handle_arrow_hit(enemy, hit_dmg)
+                if getattr(a, "pierce_remaining", 0) > 0:
+                    a.pierce_remaining -= 1
+                else:
+                    try:
+                        arrows.remove(a)
+                    except ValueError:
+                        pass
+                break
 
         # collection phase
         if not enemies and not in_collection_phase and not spawn_preview_active:
@@ -6002,8 +6662,9 @@ def game_loop():
                 orb["y"] += (dy/dist)*speed
                 if math.hypot(orb["x"]-player.centerx, orb["y"]-player.centery) < 20:
                     player_exp += orb["amount"]
-                    gems += orb["amount"]
-                    gems_this_run += orb["amount"]
+                    amt = max(1, int(round(orb["amount"] * daily_gem_mult())))
+                    gems += amt
+                    gems_this_run += amt
                     if owned_abilities.get("Bounty", False) and random.random() < 0.25:
                         gems += 1
                         gems_this_run += 1
@@ -6015,8 +6676,9 @@ def game_loop():
             if pygame.time.get_ticks() - collection_start_ms >= collection_duration_ms:
                 for orb in pending_orbs[:]:
                     player_exp += orb["amount"]
-                    gems += orb["amount"]
-                    gems_this_run += orb["amount"]
+                    amt = max(1, int(round(orb["amount"] * daily_gem_mult())))
+                    gems += amt
+                    gems_this_run += amt
                     if owned_abilities.get("Bounty", False) and random.random() < 0.25:
                         gems += 1
                         gems_this_run += 1
@@ -6041,11 +6703,12 @@ def game_loop():
                 wave += 1
                 wave_banner_number = wave
                 wave_banner_until_ms = now_ms + 2200
-                # Refresh enemy count every boss wave; otherwise scale up
+                # Refresh enemy count every boss wave; otherwise scale up (smoother cap)
+                ENEMIES_CAP = 70
                 if wave % 20 == 1:  # just finished a boss wave (wave 20, 40, ...)
                     enemies_per_wave = DEFAULTS["enemies_per_wave_start"]
                 else:
-                    enemies_per_wave = max(1, int(round(enemies_per_wave*1.1)))
+                    enemies_per_wave = min(ENEMIES_CAP, max(1, int(round(enemies_per_wave * 1.07))))
 
         # ---------- DRAW ----------
         screen.fill(bg_color)
@@ -6164,36 +6827,31 @@ def game_loop():
                     pygame.draw.polygon(flame_surf, (255, 200, 50, 90), [(cx, cy), (cx + 0.7*r*math.cos(left_ang), cy + 0.7*r*math.sin(left_ang)), (cx + 0.7*r*math.cos(right_ang), cy + 0.7*r*math.sin(right_ang))])
                     screen.blit(flame_surf, (0, 0))
             else:
-                # Mastery bow (Flame Archer with mastery unlocked): fancier, longer, amber glow
+                # Bow: same size for all (Flame Mastery keeps normal bow shape; amber color only when mastery)
                 is_mastery_bow = isinstance(player_class, FlameArcher) and flame_mastery_unlocked
-                bow_len = 78 if is_mastery_bow else 60
-                arc_rect = pygame.Rect(player.centerx - (14 if is_mastery_bow else 12), player.centery - bow_len, 28 if is_mastery_bow else 24, bow_len*2)
+                bow_len = 60
+                arc_w, arc_h = 24, bow_len * 2
+                arc_rect = pygame.Rect(player.centerx - arc_w // 2, player.centery - bow_len, arc_w, arc_h)
                 if is_mastery_bow:
                     bow_color = (255, 180, 60)
-                    bow_outer = (200, 100, 20)
                     string_color = (255, 220, 100)
                 else:
                     bow_color = BLUE if isinstance(player_class, MadScientist) else BROWN
                     string_color = BLUE if isinstance(player_class, MadScientist) else BLACK
                 try:
-                    if is_mastery_bow:
-                        pygame.draw.arc(screen, bow_outer, arc_rect, math.radians(270), math.radians(90), 7)
-                        pygame.draw.arc(screen, bow_color, arc_rect, math.radians(270), math.radians(90), 5)
-                    else:
-                        pygame.draw.arc(screen, bow_color, arc_rect, math.radians(270), math.radians(90), 4)
+                    pygame.draw.arc(screen, bow_color, arc_rect, math.radians(270), math.radians(90), 4)
                 except Exception:
                     pass
-                top = (player.centerx + (5 if is_mastery_bow else 4), player.centery - int(bow_len*0.9))
-                bottom = (player.centerx + (5 if is_mastery_bow else 4), player.centery + int(bow_len*0.9))
-                pygame.draw.line(screen, string_color, top, bottom, 5 if is_mastery_bow else 4)
-        else:
-            # sword / melee (bow and Robber drawn above)
-            mx,my = pygame.mouse.get_pos()
+                top = (player.centerx + 4, player.centery - int(bow_len * 0.9))
+                bottom = (player.centerx + 4, player.centery + int(bow_len * 0.9))
+                pygame.draw.line(screen, string_color, top, bottom, 4)
+        elif isinstance(player_class, Knight) and weapon == "sword":
+            # Knight only: sword/melee visual
+            mx, my = pygame.mouse.get_pos()
             ang = math.atan2(my - player.centery, mx - player.centerx)
-            melee_range = Assassin.KNIFE_RANGE if isinstance(player_class, Assassin) else DEFAULTS["sword_range"]
-            tipx = player.centerx + melee_range*math.cos(ang)
-            tipy = player.centery + melee_range*math.sin(ang)
-            pygame.draw.line(screen, (192,192,192), (player.centerx, player.centery), (tipx, tipy), 6 if isinstance(player_class, Assassin) else 8)
+            tipx = player.centerx + DEFAULTS["sword_range"] * math.cos(ang)
+            tipy = player.centery + DEFAULTS["sword_range"] * math.sin(ang)
+            pygame.draw.line(screen, (192, 192, 192), (player.centerx, player.centery), (tipx, tipy), 8)
 
         # spawn preview red X markers
         if spawn_preview_active:
@@ -6240,9 +6898,17 @@ def game_loop():
             )
 
         # HUD (slight background for readability)
+        hud_max_w = WIDTH - 24
+        if daily_challenge_active and daily_modifiers:
+            mod_names = " • ".join(m.get("name", "?") for m in daily_modifiers)
+            daily_str = f"Daily Challenge: {mod_names}  (wave 5+ = +{DAILY_REWARD_GEMS} gems)"
+            daily_fit = truncate_text_to_width(FONT_XS, daily_str, hud_max_w)
+            daily_txt = FONT_XS.render(daily_fit, True, (100, 80, 40))
+            screen.blit(daily_txt, (12, 12))
         hud_text = f"Score: {score}  Wave: {wave}  HP: {player_hp}  Dmg: {arrow_damage}  Gems: {gems}  Class: {player_class.name}"
-        hud = FONT_SM.render(hud_text, True, BLACK)
-        hud_rect = pygame.Rect(10, 52, hud.get_width() + 16, hud.get_height() + 8)
+        hud_text_fit = truncate_text_to_width(FONT_SM, hud_text, hud_max_w - 16)
+        hud = FONT_SM.render(hud_text_fit, True, BLACK)
+        hud_rect = pygame.Rect(10, 52, min(hud.get_width() + 16, hud_max_w), hud.get_height() + 8)
         hud_bg = pygame.Surface((hud_rect.w, hud_rect.h), pygame.SRCALPHA)
         hud_bg.fill((255, 255, 255, 200))
         screen.blit(hud_bg, hud_rect.topleft)
@@ -6288,12 +6954,14 @@ def game_loop():
                 ability_txt = FONT_MD.render("V: Overcharge ready", True, GREEN)
             screen.blit(ability_txt, (12, 84))
         if isinstance(player_class, FlameArcher) and flame_mastery_unlocked:
-            ability_txt = FONT_SM.render(f"1:Bow  3:Flamethrower  F:Bomb  [{flame_archer_weapon}]", True, BLACK)
+            ab_str = f"1:Bow  2:Flamethrower  F:Bomb  [{flame_archer_weapon}]"
+            ability_txt = FONT_SM.render(truncate_text_to_width(FONT_SM, ab_str, hud_max_w), True, BLACK)
             screen.blit(ability_txt, (12, 84))
         if isinstance(player_class, Robber):
             gun_names = {"ak47": "AK-47", "minigun": "Minigun", "shotgun": "Shotgun", "sniper": "Sniper"}
             g = robbers_gun
-            ability_txt = FONT_SM.render(f"1:AK-47  2:Minigun  3:Shotgun  4:Sniper  [{gun_names.get(g, g)}]", True, BLACK)
+            ab_str = f"1:AK-47  2:Minigun  3:Shotgun  4:Sniper  [{gun_names.get(g, g)}]"
+            ability_txt = FONT_SM.render(truncate_text_to_width(FONT_SM, ab_str, hud_max_w), True, BLACK)
             screen.blit(ability_txt, (12, 84))
             if minigun_charge_start_ms and now_ms < minigun_charge_start_ms + ROBBER_MINIGUN_CHARGE_MS:
                 pct = min(100, int(100 * (now_ms - minigun_charge_start_ms) / ROBBER_MINIGUN_CHARGE_MS))
@@ -6346,6 +7014,8 @@ def game_loop():
 # ---------- ENTRY ----------
 if __name__ == "__main__":
     reset_game()
+    if not settings.get("tutorial_completed", False):
+        tutorial_screen()
     while True:
         choice = main_menu()
         if choice == "resume":
