@@ -69,6 +69,15 @@ def _ensure_dependencies():
 
 _ensure_dependencies()
 
+# Headless safe mode for server (no window needed)
+if "--server" in sys.argv:
+    os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+
+try:
+    import websockets
+except Exception:
+    websockets = None
+
 import pygame  # type: ignore[import-untyped]
 pygame.init()
 
@@ -146,6 +155,13 @@ def _load_json_with_backup(path):
 DEFAULT_WIDTH, DEFAULT_HEIGHT = 1280, 800
 SAVE_SLOTS = ["save1.json", "save2.json", "save3.json"]
 current_save_slot = 1  # 1..3
+
+# Online defaults
+ONLINE_USERNAME = os.environ.get("IA_NAME", "Player")
+ONLINE_ENABLED = True
+online_mode = False
+online_coop_enemies = True  # server-authoritative enemies
+net = None
 
 def get_settings_path():
     return os.path.join(_get_data_dir(), "settings.json")
@@ -500,14 +516,631 @@ def truncate_text_to_width(font, text, max_pixel_width, ellipsis="…"):
             return text[:i] + ellipsis
     return ellipsis
 
-# (Online/server code removed; add back later)
+# ---------- ONLINE (CLIENT) ----------
+# Fixes:
+# - Less lag: send input at 20hz, not every frame
+# - Ghost player fix: server only broadcasts players after first input (active=True)
+# - Remote arrows: server broadcasts "shots"; clients render them
+
+class NetClient:
+    def __init__(self, url):
+        self.url = url
+        self.id = None
+        self.connected = False
+        self.last_error = ""
+        self.last_status = "DISCONNECTED"
+
+        self._loop = None
+        self._ws = None
+        self._lock = threading.Lock()
+
+        self.players = {}
+        self.enemies = {}
+        self.shots = []
+        self.chat = []
+        self._lobby_status = None
+        self._load_result = None   # {"slot", "data", "error"} from server
+        self._meta_result = None  # {"slots"} or {"slot", "data", "error"}
+        self._last_send_ms = 0
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_until_complete(self._main())
+
+    async def _main(self):
+        if websockets is None:
+            self.last_status = "NO_WEBSOCKETS"
+            self.last_error = "websockets package not installed"
+            return
+
+        while True:
+            try:
+                self.last_status = "CONNECTING"
+                self.last_error = ""
+                async with websockets.connect(
+                    self.url,
+                    ping_interval=30,
+                    ping_timeout=10,
+                    max_size=2_000_000,
+                    open_timeout=5,
+                    close_timeout=2,
+                ) as ws:
+                    self._ws = ws
+                    self.connected = True
+                    self.last_status = "CONNECTED"
+
+                    async for msg in ws:
+                        try:
+                            data = json.loads(msg)
+                        except Exception:
+                            continue
+                        t = data.get("type")
+                        if t == "welcome":
+                            self.last_status = "CONNECTED"
+                        elif t == "hello":
+                            self.id = data.get("id")
+                            self.last_status = "ONLINE"
+                            try:
+                                await ws.send(json.dumps({"type": "identify", "username": str(ONLINE_USERNAME)[:64]}))
+                            except Exception:
+                                pass
+                        elif t == "load_result":
+                            with self._lock:
+                                self._load_result = {"slot": data.get("slot"), "data": data.get("data"), "error": data.get("error")}
+                        elif t == "meta_result":
+                            with self._lock:
+                                self._meta_result = {"slots": data.get("slots"), "slot": data.get("slot"), "data": data.get("data"), "error": data.get("error")}
+                        elif t == "lobby_created":
+                            with self._lock:
+                                self._lobby_status = "created"
+                        elif t == "lobby_joined":
+                            with self._lock:
+                                self._lobby_status = "joined"
+                        elif t == "lobby_error":
+                            with self._lock:
+                                self._lobby_status = ("error", str(data.get("msg", "Unknown error")))
+                        elif t == "state":
+                            with self._lock:
+                                self.players = data.get("players", {})
+                        elif t == "enemies":
+                            with self._lock:
+                                self.enemies = {str(e.get("id")): e for e in data.get("enemies", [])}
+                        elif t == "shots":
+                            # server sends a batch of recent shots
+                            shots = data.get("shots", [])
+                            with self._lock:
+                                self.shots = shots[-80:]  # cap
+                        elif t == "chat":
+                            msgs = data.get("messages", [])
+                            with self._lock:
+                                self.chat = msgs[-60:]
+
+            except Exception as e:
+                self.connected = False
+                self._ws = None
+                self.last_status = "RECONNECTING" if self.id else "DISCONNECTED"
+                self.last_error = str(e)
+
+            await asyncio.sleep(0.3)
+
+    def send_input_throttled(self, x, y, weapon):
+        if not self.connected or self._ws is None or self._loop is None:
+            return
+        now = pygame.time.get_ticks()
+        if now - self._last_send_ms < 50:  # 20hz
+            return
+        self._last_send_ms = now
+        payload = {"type":"input","x":float(x),"y":float(y),"weapon":weapon,"name":str(ONLINE_USERNAME)}
+        try:
+            asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(payload)), self._loop)
+        except Exception as e:
+            self.last_error = str(e)
+
+    def send_shoot(self, x, y, vx, vy):
+        if not self.connected or self._ws is None or self._loop is None:
+            return
+        payload = {"type":"shoot","x":float(x),"y":float(y),"vx":float(vx),"vy":float(vy)}
+        try:
+            asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(payload)), self._loop)
+        except Exception as e:
+            self.last_error = str(e)
+
+    def send_hit(self, enemy_id, dmg):
+        if not self.connected or self._ws is None or self._loop is None:
+            return
+        payload = {"type":"hit","enemy_id":str(enemy_id),"dmg":float(dmg)}
+        try:
+            asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(payload)), self._loop)
+        except Exception as e:
+            self.last_error = str(e)
+
+    def send_chat(self, msg: str):
+        if not self.connected or self._ws is None or self._loop is None:
+            return
+        payload = {"type": "chat", "msg": str(msg)[:160], "name": str(ONLINE_USERNAME)[:16]}
+        try:
+            asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(payload)), self._loop)
+        except Exception as e:
+            self.last_error = str(e)
+
+    def send_create_lobby(self, name: str, password: str):
+        if not self.connected or self._ws is None or self._loop is None:
+            return
+        with self._lock:
+            self._lobby_status = None
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._ws.send(json.dumps({"type": "create_lobby", "name": str(name)[:32], "password": str(password)[:32]})),
+                self._loop,
+            )
+        except Exception as e:
+            self.last_error = str(e)
+
+    def send_join_lobby(self, name: str, password: str):
+        if not self.connected or self._ws is None or self._loop is None:
+            return
+        with self._lock:
+            self._lobby_status = None
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._ws.send(json.dumps({"type": "join_lobby", "name": str(name)[:32], "password": str(password)[:32]})),
+                self._loop,
+            )
+        except Exception as e:
+            self.last_error = str(e)
+
+    def get_lobby_status(self):
+        with self._lock:
+            out = self._lobby_status
+            self._lobby_status = None
+        return out
+
+    def send_save(self, slot: int, data: dict):
+        if not self.connected or self._ws is None or self._loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._ws.send(json.dumps({"type": "save", "slot": max(1, min(3, slot)), "data": data})),
+                self._loop,
+            )
+        except Exception as e:
+            self.last_error = str(e)
+
+    def send_load(self, slot: int):
+        if not self.connected or self._ws is None or self._loop is None:
+            return
+        with self._lock:
+            self._load_result = None
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._ws.send(json.dumps({"type": "load", "slot": max(1, min(3, slot))})),
+                self._loop,
+            )
+        except Exception as e:
+            self.last_error = str(e)
+
+    def send_meta_get(self, slot=None):
+        if not self.connected or self._ws is None or self._loop is None:
+            return
+        with self._lock:
+            self._meta_result = None
+        try:
+            payload = {"type": "meta_get"}
+            if slot is not None:
+                payload["slot"] = max(1, min(3, slot))
+            asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(payload)), self._loop)
+        except Exception as e:
+            self.last_error = str(e)
+
+    def send_meta_set(self, slot: int, data: dict):
+        if not self.connected or self._ws is None or self._loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._ws.send(json.dumps({"type": "meta_set", "slot": max(1, min(3, slot)), "data": data})),
+                self._loop,
+            )
+        except Exception as e:
+            self.last_error = str(e)
+
+    def send_delete_save(self, slot: int):
+        if not self.connected or self._ws is None or self._loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._ws.send(json.dumps({"type": "delete_save", "slot": max(1, min(3, slot))})),
+                self._loop,
+            )
+        except Exception as e:
+            self.last_error = str(e)
+
+    def get_load_result(self):
+        with self._lock:
+            out = self._load_result
+            self._load_result = None
+        return out
+
+    def get_meta_result(self):
+        with self._lock:
+            out = self._meta_result
+            self._meta_result = None
+        return out
+
+    def snapshot(self):
+        with self._lock:
+            return dict(self.players), dict(self.enemies), list(self.shots), list(self.chat)
+
+# ---------- ONLINE (SERVER) ----------
+import sqlite3
+
+SERVER_DB_PATH = "infinite_archer.db"
 
 
+def _db_init():
+    conn = sqlite3.connect(SERVER_DB_PATH)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS saves (
+            user_id TEXT NOT NULL, slot INTEGER NOT NULL, data TEXT NOT NULL, updated_at REAL NOT NULL,
+            PRIMARY KEY (user_id, slot));
+        CREATE TABLE IF NOT EXISTS meta (
+            user_id TEXT NOT NULL, slot INTEGER NOT NULL, data TEXT NOT NULL, updated_at REAL NOT NULL,
+            PRIMARY KEY (user_id, slot));
+    """)
+    conn.commit()
+    conn.close()
+
+
+def _db_save(user_id, slot, data, kind):
+    conn = sqlite3.connect(SERVER_DB_PATH)
+    now = time.time()
+    tbl = "saves" if kind == "save" else "meta"
+    conn.execute(
+        f"INSERT INTO {tbl} (user_id, slot, data, updated_at) VALUES (?, ?, ?, ?)"
+        " ON CONFLICT(user_id, slot) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at",
+        (user_id, slot, json.dumps(data), now),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _db_load(user_id, slot, kind):
+    conn = sqlite3.connect(SERVER_DB_PATH)
+    tbl = "saves" if kind == "save" else "meta"
+    row = conn.execute(f"SELECT data FROM {tbl} WHERE user_id = ? AND slot = ?", (user_id, slot)).fetchone()
+    conn.close()
+    return json.loads(row[0]) if row else None
+
+
+def _db_meta_all(user_id):
+    conn = sqlite3.connect(SERVER_DB_PATH)
+    rows = conn.execute("SELECT slot, data FROM meta WHERE user_id = ?", (user_id,)).fetchall()
+    conn.close()
+    return {slot: json.loads(data) for slot, data in rows}
+
+
+def _db_delete_save(user_id, slot):
+    conn = sqlite3.connect(SERVER_DB_PATH)
+    conn.execute("DELETE FROM saves WHERE user_id = ? AND slot = ?", (user_id, slot))
+    conn.execute("DELETE FROM meta WHERE user_id = ? AND slot = ?", (user_id, slot))
+    conn.commit()
+    conn.close()
+
+
+async def run_server(host="0.0.0.0", port=8765, tick_hz=20):
+    if websockets is None:
+        print("websockets not installed. Run: python -m pip install websockets")
+        return
+
+    import uuid
+    _db_init()
+    lobbies = {}  # lobby_id -> { name, password, connections: set(ws), players, enemies, shots, chat, wave, enemies_per_wave, next_enemy_id }
+    ws_lobby = {}  # ws -> lobby_id
+    ws_pid = {}    # ws -> pid
+    ws_user = {}   # ws -> user_id for cloud saves
+
+    def spawn_wave_for_lobby(lob):
+        lob["enemies"] = {}
+        n = int(lob["enemies_per_wave"])
+        for _ in range(n):
+            eid = str(lob["next_enemy_id"]); lob["next_enemy_id"] += 1
+            etype = random.choices(["normal","fast","tank","archer"], weights=[50,30,10,10])[0]
+            side = random.choice(["top","bottom","left","right"])
+            if side == "top": x, y = random.randint(80, 1200), -40
+            elif side == "bottom": x, y = random.randint(80, 1200), 900
+            elif side == "left": x, y = -40, random.randint(80, 700)
+            else: x, y = 1400, random.randint(80, 700)
+            if etype == "normal": hp, spd = 40, 2.0
+            elif etype == "fast": hp, spd = 30, 3.0
+            elif etype == "tank": hp, spd = 80, 1.2
+            else: hp, spd = 36, 2.0
+            lob["enemies"][eid] = {"id":eid,"x":float(x),"y":float(y),"w":30,"h":30,"hp":float(hp),"etype":etype,"spd":float(spd)}
+
+    async def handler(ws):
+        pid = None
+        user_id = None
+        lobby_id = None
+        try:
+            await ws.send(json.dumps({"type": "welcome"}))
+        except Exception:
+            pass
+        try:
+            async for msg in ws:
+                try:
+                    data = json.loads(msg)
+                except Exception:
+                    continue
+
+                t = data.get("type")
+
+                # Must create or join lobby before any game/save messages
+                if t == "create_lobby":
+                    name = (data.get("name") or "").strip()[:32]
+                    password = (data.get("password") or "")[:32]
+                    if not name:
+                        await ws.send(json.dumps({"type": "lobby_error", "msg": "Lobby name required"}))
+                        continue
+                    if any(l.get("name") == name for l in lobbies.values()):
+                        await ws.send(json.dumps({"type": "lobby_error", "msg": "Name already taken"}))
+                        continue
+                    lobby_id = uuid.uuid4().hex[:12]
+                    pid = uuid.uuid4().hex[:8]
+                    lobbies[lobby_id] = {
+                        "name": name, "password": password, "connections": {ws},
+                        "players": {pid: {"x":0.0,"y":0.0,"weapon":"bow","name":"Player","active":False,"last":time.time()}},
+                        "enemies": {}, "shots": [], "chat": [],
+                        "wave": 1, "enemies_per_wave": 5, "next_enemy_id": 1,
+                    }
+                    spawn_wave_for_lobby(lobbies[lobby_id])
+                    ws_lobby[ws] = lobby_id
+                    ws_pid[ws] = pid
+                    ws_user[ws] = pid
+                    await ws.send(json.dumps({"type": "lobby_created", "lobby_id": lobby_id, "name": name}))
+                    await ws.send(json.dumps({"type": "hello", "id": pid}))
+                    await ws.send(json.dumps({"type": "chat", "messages": []}))
+                    await ws.send(json.dumps({"type": "state", "players": {pid: lobbies[lobby_id]["players"][pid]}}))
+                    await ws.send(json.dumps({"type": "enemies", "enemies": list(lobbies[lobby_id]["enemies"].values())}))
+                    await ws.send(json.dumps({"type": "shots", "shots": []}))
+                    continue
+
+                if t == "join_lobby":
+                    name = (data.get("name") or "").strip()[:32]
+                    password = (data.get("password") or "")[:32]
+                    if not name:
+                        await ws.send(json.dumps({"type": "lobby_error", "msg": "Lobby name required"}))
+                        continue
+                    found = None
+                    for lid, lob in lobbies.items():
+                        if lob["name"] == name:
+                            found = (lid, lob)
+                            break
+                    if not found:
+                        await ws.send(json.dumps({"type": "lobby_error", "msg": "Lobby not found"}))
+                        continue
+                    lid, lob = found
+                    if lob["password"] != password:
+                        await ws.send(json.dumps({"type": "lobby_error", "msg": "Wrong password"}))
+                        continue
+                    lobby_id = lid
+                    pid = uuid.uuid4().hex[:8]
+                    lob["connections"].add(ws)
+                    lob["players"][pid] = {"x":0.0,"y":0.0,"weapon":"bow","name":"Player","active":False,"last":time.time()}
+                    ws_lobby[ws] = lobby_id
+                    ws_pid[ws] = pid
+                    ws_user[ws] = pid
+                    await ws.send(json.dumps({"type": "lobby_joined", "lobby_id": lobby_id, "name": lob["name"]}))
+                    await ws.send(json.dumps({"type": "hello", "id": pid}))
+                    await ws.send(json.dumps({"type": "chat", "messages": lob["chat"][-60:]}))
+                    payload_players = {p: pl for p, pl in lob["players"].items() if pl.get("active", False)}
+                    await ws.send(json.dumps({"type": "state", "players": payload_players}))
+                    await ws.send(json.dumps({"type": "enemies", "enemies": list(lob["enemies"].values())}))
+                    await ws.send(json.dumps({"type": "shots", "shots": lob["shots"][-80:]}))
+                    continue
+
+                # From here on we must be in a lobby
+                if lobby_id is None or lobby_id not in lobbies:
+                    continue
+                lob = lobbies[lobby_id]
+                players = lob["players"]
+                enemies = lob["enemies"]
+                shots = lob["shots"]
+                chat = lob["chat"]
+
+                if t == "identify":
+                    uname = (data.get("username") or data.get("name") or "").strip()
+                    if uname:
+                        ws_user[ws] = uname[:64]
+
+                elif t == "input":
+                    p = players.get(pid)
+                    if not p:
+                        continue
+                    p["last"] = time.time()
+                    if "x" in data and "y" in data:
+                        p["x"] = float(data["x"])
+                        p["y"] = float(data["y"])
+                        p["active"] = True
+                    if "weapon" in data:
+                        p["weapon"] = str(data["weapon"])
+                    if "name" in data and str(data["name"]).strip():
+                        p["name"] = str(data["name"])[:16]
+                        if ws_user.get(ws) == pid:
+                            ws_user[ws] = str(data["name"]).strip()[:64]
+
+                elif t == "save":
+                    uid = ws_user.get(ws, pid)
+                    slot = max(1, min(3, int(data.get("slot", 1))))
+                    payload = data.get("data")
+                    if isinstance(payload, dict):
+                        try:
+                            _db_save(uid, slot, payload, "save")
+                            await ws.send(json.dumps({"type": "save_ok", "slot": slot}))
+                        except Exception as e:
+                            await ws.send(json.dumps({"type": "save_ok", "slot": slot, "error": str(e)}))
+                    else:
+                        await ws.send(json.dumps({"type": "save_ok", "slot": slot, "error": "missing data"}))
+
+                elif t == "load":
+                    uid = ws_user.get(ws, pid)
+                    slot = max(1, min(3, int(data.get("slot", 1))))
+                    try:
+                        out = _db_load(uid, slot, "save")
+                        if out is not None:
+                            await ws.send(json.dumps({"type": "load_result", "slot": slot, "data": out}))
+                        else:
+                            await ws.send(json.dumps({"type": "load_result", "slot": slot, "error": "no_save"}))
+                    except Exception as e:
+                        await ws.send(json.dumps({"type": "load_result", "slot": slot, "error": str(e)}))
+
+                elif t == "meta_get":
+                    uid = ws_user.get(ws, pid)
+                    slot = data.get("slot")
+                    try:
+                        if slot is not None:
+                            slot = max(1, min(3, int(slot)))
+                            out = _db_load(uid, slot, "meta")
+                            await ws.send(json.dumps({"type": "meta_result", "slot": slot, "data": out}))
+                        else:
+                            all_meta = _db_meta_all(uid)
+                            by_slot = {}
+                            for s in (1, 2, 3):
+                                m = all_meta.get(s)
+                                by_slot[s] = {"gems": m.get("gems", 0), "player_class": m.get("player_class", "No Class")} if m else {"gems": 0, "player_class": "No Class"}
+                            await ws.send(json.dumps({"type": "meta_result", "slots": by_slot}))
+                    except Exception as e:
+                        await ws.send(json.dumps({"type": "meta_result", "error": str(e)}))
+
+                elif t == "meta_set":
+                    uid = ws_user.get(ws, pid)
+                    slot = max(1, min(3, int(data.get("slot", 1))))
+                    payload = data.get("data")
+                    if isinstance(payload, dict):
+                        try:
+                            _db_save(uid, slot, payload, "meta")
+                            await ws.send(json.dumps({"type": "meta_ok", "slot": slot}))
+                        except Exception as e:
+                            await ws.send(json.dumps({"type": "meta_ok", "slot": slot, "error": str(e)}))
+
+                elif t == "delete_save":
+                    uid = ws_user.get(ws, pid)
+                    slot = max(1, min(3, int(data.get("slot", 1))))
+                    try:
+                        _db_delete_save(uid, slot)
+                        await ws.send(json.dumps({"type": "delete_ok", "slot": slot}))
+                    except Exception as e:
+                        await ws.send(json.dumps({"type": "delete_ok", "slot": slot, "error": str(e)}))
+
+                elif t == "shoot":
+                    p = players.get(pid)
+                    if not p or not p.get("active", False):
+                        continue
+                    sx = float(data.get("x", p["x"]))
+                    sy = float(data.get("y", p["y"]))
+                    vx = float(data.get("vx", 0))
+                    vy = float(data.get("vy", 0))
+                    shots.append({"pid": pid, "x": sx, "y": sy, "vx": vx, "vy": vy, "ts": time.time()})
+                    if len(shots) > 120:
+                        shots[:] = shots[-120:]
+
+                elif t == "hit":
+                    eid = str(data.get("enemy_id"))
+                    dmg = float(data.get("dmg", 0))
+                    if eid in enemies and dmg > 0:
+                        enemies[eid]["hp"] -= dmg
+                        if enemies[eid]["hp"] <= 0:
+                            enemies.pop(eid, None)
+                elif t == "chat":
+                    name = str(data.get("name") or players.get(pid, {}).get("name") or "Player")[:16]
+                    msg_txt = str(data.get("msg") or "").strip()[:160]
+                    if msg_txt:
+                        chat.append({"name": name, "msg": msg_txt, "ts": time.time()})
+                        if len(chat) > 60:
+                            del chat[:-60]
+                        try:
+                            websockets.broadcast(lob["connections"], json.dumps({"type": "chat", "messages": chat[-60:]}))
+                        except Exception:
+                            pass
+
+        finally:
+            if lobby_id and lobby_id in lobbies:
+                lob = lobbies[lobby_id]
+                lob["connections"].discard(ws)
+                if pid and pid in lob["players"]:
+                    lob["players"].pop(pid, None)
+                if not lob["connections"]:
+                    lobbies.pop(lobby_id, None)
+            ws_lobby.pop(ws, None)
+            ws_pid.pop(ws, None)
+            ws_user.pop(ws, None)
+
+    async def tick_loop():
+        while True:
+            now = time.time()
+            for lobby_id, lob in list(lobbies.items()):
+                players = lob["players"]
+                enemies = lob["enemies"]
+                shots = lob["shots"]
+                chat = lob["chat"]
+                for pid in list(players.keys()):
+                    if now - float(players[pid].get("last", now)) > 15:
+                        players.pop(pid, None)
+                actives = [p for p in players.values() if p.get("active", False)]
+                if actives:
+                    for e in list(enemies.values()):
+                        ex = e["x"] + e["w"]/2
+                        ey = e["y"] + e["h"]/2
+                        best = None
+                        bestd = 1e18
+                        for p in actives:
+                            dx = float(p["x"]) - ex
+                            dy = float(p["y"]) - ey
+                            d = dx*dx + dy*dy
+                            if d < bestd:
+                                bestd = d
+                                best = p
+                        if best:
+                            dx = float(best["x"]) - ex
+                            dy = float(best["y"]) - ey
+                            dist = math.hypot(dx, dy) or 1.0
+                            spd = float(e.get("spd", 2.0))
+                            e["x"] += (dx/dist)*spd
+                            e["y"] += (dy/dist)*spd
+                if not enemies:
+                    lob["wave"] += 1
+                    lob["enemies_per_wave"] = max(1, int(round(lob["enemies_per_wave"]*1.10)))
+                    spawn_wave_for_lobby(lob)
+                payload_players = {p: pl for p, pl in players.items() if pl.get("active", False)}
+                lob["shots"] = [s for s in shots if now - s.get("ts", now) < 2.0]
+                lob["chat"] = [c for c in chat if now - float(c.get("ts", now)) < 600]
+                if lob["connections"]:
+                    try:
+                        websockets.broadcast(lob["connections"], json.dumps({"type": "state", "players": payload_players}))
+                        websockets.broadcast(lob["connections"], json.dumps({"type": "enemies", "enemies": list(lob["enemies"].values())}))
+                        websockets.broadcast(lob["connections"], json.dumps({"type": "shots", "shots": lob["shots"]}))
+                    except Exception:
+                        pass
+            await asyncio.sleep(1.0 / float(tick_hz))
+
+    try:
+        async with websockets.serve(handler, host, port, ping_interval=30, ping_timeout=10, max_size=2_000_000):
+            print(f"Infinite Archer server: ws://127.0.0.1:{port} (this machine)")
+            print(f"  Client connects to that URL. Press Ctrl+C to stop.")
+            await tick_loop()
+    except OSError as e:
+        if "48" in str(e) or "in use" in str(e).lower() or "Address already" in str(e):
+            print(f"Port {port} already in use. Stop the other process or use a different port.")
+        else:
+            print(f"Server failed to start: {e}")
+        raise
 
 
 # =========================
 # FULL REPLACEMENT (PART 2/3)
 # =========================
+
 
 # ---------- GAME CLASSES ----------
 class Enemy:
@@ -1786,9 +2419,20 @@ def reset_game():
     global flame_bomb_ball, flame_bomb_zone
     global flame_mastery_kills_burning, flame_mastery_kills_dot_final, flame_mastery_bosses_burning, flame_mastery_unlocked
     global daily_challenge_active, daily_modifiers
+    global net, online_mode
 
     daily_challenge_active = False
     daily_modifiers = []
+
+    # Online: connect when online_mode is set (e.g. from main menu Online -> lobby)
+    if not ONLINE_ENABLED and online_mode:
+        online_mode = False
+    if ONLINE_ENABLED and online_mode and websockets is not None:
+        url = os.environ.get("IA_SERVER", "ws://127.0.0.1:8765")
+        net = NetClient(url)
+        net.start()
+    else:
+        net = None
 
     size = DEFAULTS["player_size"]
     player = pygame.Rect(WIDTH//2 - size//2, HEIGHT//2 - size//2, size, size)
@@ -5360,10 +6004,114 @@ def class_shop_menu():
                     save_game()
                     return
 
-# ---------- Lobby (stub; online removed) ----------
+# ---------- Lobby (create/join online game) ----------
 def lobby_screen():
-    """Stub: online removed. Returns 'back'."""
-    return "back"
+    """Create or join a lobby with name + password. Returns 'ok' when in a lobby, 'back' to cancel."""
+    global net
+    lobby_name = ""
+    lobby_password = ""
+    focus = 0  # 0 = name, 1 = password
+    bar_w = 320
+    bar_h = 40
+    bar_x = WIDTH//2 - bar_w//2
+    name_y = HEIGHT//2 - 120
+    pass_y = HEIGHT//2 - 50
+    create_rect = pygame.Rect(WIDTH//2 - 110, HEIGHT//2 + 20, 100, 44)
+    join_rect = pygame.Rect(WIDTH//2 + 10, HEIGHT//2 + 20, 100, 44)
+    back_rect = pygame.Rect(WIDTH//2 - 60, HEIGHT//2 + 90, 120, 44)
+    waiting = None  # "create" or "join" while waiting for server
+
+    while True:
+        screen.fill(bg_color)
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill(UI_OVERLAY_DARK)
+        screen.blit(overlay, (0, 0))
+        draw_text_centered(FONT_LG, "Online Lobby", HEIGHT//2 - 200, WHITE, y_is_center=True)
+        draw_text_centered(FONT_SM, "Lobby name", name_y - 24, (200, 200, 200))
+        draw_text_centered(FONT_SM, "Password", pass_y - 24, (200, 200, 200))
+        mx, my = pygame.mouse.get_pos()
+
+        for (y, text, is_pass) in [(name_y, lobby_name, False), (pass_y, lobby_password, True)]:
+            disp = ("*" * len(text)) if is_pass else text
+            border = (120, 180, 120) if (y == name_y and focus == 0) or (y == pass_y and focus == 1) else (80, 80, 80)
+            pygame.draw.rect(screen, (40, 40, 40), (bar_x, y, bar_w, bar_h))
+            pygame.draw.rect(screen, border, (bar_x, y, bar_w, bar_h), 3)
+            prompt = FONT_MD.render(disp + ("|" if (pygame.time.get_ticks() // 500) % 2 and ((y == name_y and focus == 0) or (y == pass_y and focus == 1)) else ""), True, (220, 220, 220))
+            screen.blit(prompt, (bar_x + 12, y + (bar_h - prompt.get_height())//2))
+
+        can_use = net and net.connected
+        if waiting and can_use:
+            status = net.get_lobby_status()
+            if status == "created" or status == "joined":
+                return "ok"
+            if isinstance(status, tuple) and status[0] == "error":
+                notify_once(status[1][:50], 2000)
+                waiting = None
+            draw_text_centered(FONT_SM, "Waiting...", HEIGHT//2 + 75, (200, 200, 100), y_is_center=True)
+        else:
+            draw_button(create_rect, "Create", hover=can_use and create_rect.collidepoint(mx, my), text_color=UI_TEXT)
+            draw_button(join_rect, "Join", hover=can_use and join_rect.collidepoint(mx, my), text_color=UI_TEXT)
+            draw_button(back_rect, "Back", hover=back_rect.collidepoint(mx, my), text_color=UI_TEXT)
+
+        if not (net and net.connected):
+            draw_text_centered(FONT_MD, "Connecting...", HEIGHT//2 - 168, (200, 200, 100), y_is_center=True)
+            if net and net.last_error:
+                err = net.last_error
+                if "61" in err or "refused" in err.lower() or "Connection refused" in err:
+                    draw_text_centered(FONT_SM, "Run in a terminal:  python game.py --server", HEIGHT//2 - 142, (220, 180, 120), y_is_center=True)
+                else:
+                    err = (err[:50] + "..") if len(err) > 50 else err
+                    draw_text_centered(FONT_XS, err, HEIGHT//2 - 148, (220, 120, 120), y_is_center=True)
+            else:
+                draw_text_centered(FONT_XS, "Run in a terminal:  python game.py --server", HEIGHT//2 - 132, (140, 140, 140), y_is_center=True)
+        else:
+            draw_text_centered(FONT_XS, "Create a new lobby or join one with name + password", HEIGHT//2 - 250, (160, 160, 160), y_is_center=True)
+        pygame.display.flip()
+
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                return "back"
+            if ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_ESCAPE:
+                    return "back"
+                if ev.key == pygame.K_TAB:
+                    focus = 1 - focus
+                    continue
+                if waiting:
+                    continue
+                target = lobby_name if focus == 0 else lobby_password
+                if ev.key == pygame.K_BACKSPACE:
+                    target = target[:-1]
+                elif ev.unicode and ev.unicode.isprintable() and len(target) < 32:
+                    target += ev.unicode
+                if focus == 0:
+                    lobby_name = target
+                else:
+                    lobby_password = target
+                continue
+            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1 and not waiting:
+                if pygame.Rect(bar_x, name_y, bar_w, bar_h).collidepoint(ev.pos):
+                    focus = 0
+                elif pygame.Rect(bar_x, pass_y, bar_w, bar_h).collidepoint(ev.pos):
+                    focus = 1
+                elif create_rect.collidepoint(ev.pos) and can_use:
+                    if not lobby_name.strip():
+                        notify_once("Enter a lobby name", 1200)
+                    else:
+                        play_sound("menu_click")
+                        net.send_create_lobby(lobby_name.strip(), lobby_password)
+                        waiting = "create"
+                elif join_rect.collidepoint(ev.pos) and can_use:
+                    if not lobby_name.strip():
+                        notify_once("Enter a lobby name", 1200)
+                    else:
+                        play_sound("menu_click")
+                        net.send_join_lobby(lobby_name.strip(), lobby_password)
+                        waiting = "join"
+                elif back_rect.collidepoint(ev.pos):
+                    play_sound("menu_click")
+                    return "back"
+        clock.tick(FPS)
 
 
 # Admin: type 6543 in game to get black screen, then type code in bar and Submit. Valid codes:
@@ -5984,7 +6732,7 @@ def tutorial_screen():
         clock.tick(FPS)
 
 def main_menu():
-    global current_save_slot, daily_challenge_active, daily_modifiers
+    global current_save_slot, daily_challenge_active, daily_modifiers, online_mode, net
     refresh_all_slot_meta()
     start_background_music()
 
@@ -6000,10 +6748,11 @@ def main_menu():
         new_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 - 140, btn_w, btn_h)
         resume_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 - 40, btn_w, btn_h)
         daily_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 + 60, btn_w, btn_h)
+        online_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 + 110, btn_w, btn_h)
         quit_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 + 160, btn_w, btn_h)
         class_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 + 260, btn_w, btn_h)
 
-        for rect, label in [(new_rect, "Create New Game"), (resume_rect, "Resume Game"), (daily_rect, "Daily Challenge"), (quit_rect, "Quit")]:
+        for rect, label in [(new_rect, "Create New Game"), (resume_rect, "Resume Game"), (daily_rect, "Daily Challenge"), (online_rect, "Online"), (quit_rect, "Quit")]:
             draw_button(rect, label, hover=rect.collidepoint(mx, my))
         draw_button(class_rect, "Classes", hover=class_rect.collidepoint(mx, my))
 
@@ -6088,6 +6837,18 @@ def main_menu():
                         daily_modifiers[:] = get_todays_daily_modifiers()
                         apply_daily_modifiers()
                         return "new"
+                if online_rect.collidepoint(ev.pos):
+                    play_sound("menu_click")
+                    if websockets is None:
+                        notify_once("Install websockets first: pip install websockets", 1200)
+                    else:
+                        online_mode = True
+                        reset_game()
+                        result = lobby_screen()
+                        if result == "ok":
+                            return "new"
+                        online_mode = False
+                        net = None
                 if class_rect.collidepoint(ev.pos):
                     play_sound("menu_click")
                     reset_game()
@@ -7013,6 +7774,12 @@ def game_loop():
 
 # ---------- ENTRY ----------
 if __name__ == "__main__":
+    if "--server" in sys.argv:
+        if websockets is None:
+            print("websockets not installed. Run: pip install websockets")
+            sys.exit(1)
+        asyncio.run(run_server("0.0.0.0", 8765, 20))
+        sys.exit(0)
     reset_game()
     if not settings.get("tutorial_completed", False):
         tutorial_screen()
