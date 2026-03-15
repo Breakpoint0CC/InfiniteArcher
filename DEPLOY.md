@@ -66,7 +66,7 @@ Or clone from Git on the droplet:
 
 ```bash
 # On droplet
-git clone https://github.com/YOUR_USER/InfiniteArcher.git
+git clone https://github.com/Breakpoint0CC/InfiniteArcher.git
 cd InfiniteArcher
 ```
 
@@ -104,20 +104,38 @@ python game.py --server
 
 ---
 
-## 4. Connect from your game client
+## 4. Gems on server (automated)
+
+The same server provides:
+
+The server stores **gems and owned classes** per player name and slot. Same progress for the same player across devices.
+
+**For players:** No setup. Run the game → enter your name at the first screen (before the tutorial) → play. Gems sync to the server automatically.
+
+**For the host:** To point all clients at your droplet, set the server URL once. In the game’s settings file (e.g. in the same folder as the game, or in the app data folder: `settings.json`), add or edit:
+
+```json
+"server_url": "ws://YOUR_DROPLET_IP:8765"
+```
+
+If `server_url` is missing or empty, the game uses the default server URL in code.
+
+---
+
+## 5. Connect from your game client
 
 On your **local machine** (where you run the game normally):
 
 1. Run the game: `python game.py`
-2. In the main menu, choose **Online**.
-3. In the lobby, either **Host** or **Join** a game.
-4. When joining, use the **droplet’s public IP** as the server address (and port **8765** if the client asks).
+2. First time: enter your name at the welcome screen, then complete or skip the tutorial.
+3. **Gems** sync to the server automatically (no env vars).
+4. For **Online** play: in the main menu choose **Online**, then **Host** or **Join** a game. Use the droplet’s public IP as the server address if joining remotely.
 
-The server has no built-in auth; it’s for trusted play. For production you’d add a firewall (e.g. UFW above), keep the OS updated, and consider HTTPS/WSS if you add a web front end later.
+The server has no built-in auth; it’s for trusted play.
 
 ---
 
-## 5. Quick reference
+## 6. Quick reference
 
 | What              | Command / value        |
 |-------------------|------------------------|

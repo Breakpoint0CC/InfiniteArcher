@@ -156,15 +156,103 @@ DEFAULT_WIDTH, DEFAULT_HEIGHT = 1280, 800
 SAVE_SLOTS = ["save1.json", "save2.json", "save3.json"]
 current_save_slot = 1  # 1..3
 
-# Online defaults
-ONLINE_USERNAME = os.environ.get("IA_NAME", "Player")
+# Online
 ONLINE_ENABLED = True
 online_mode = False
 online_coop_enemies = True  # server-authoritative enemies
 net = None
 
+DEFAULT_SERVER_URL = "ws://best-server-ever.josh.zajork.com:8765"
+
+def get_player_name():
+    """Player name (set at first launch before tutorial). Used for server gems and online play."""
+    return (settings.get("player_name") or "Player").strip()[:64] or "Player"
+
+def get_server_url():
+    """Server URL for gems sync and online play. From settings or default."""
+    return (settings.get("server_url") or DEFAULT_SERVER_URL).strip() or DEFAULT_SERVER_URL
+
 def get_settings_path():
     return os.path.join(_get_data_dir(), "settings.json")
+
+def fetch_meta_from_server(slot=None, timeout_sec=2):
+    """Fetch meta (gems, classes, etc.) from server for current user. Returns dict or {1:..., 2:..., 3:...} or None. Short timeout to avoid blocking UI."""
+    if websockets is None:
+        return None
+    server_url = get_server_url()
+    user_id = get_player_name()
+    result = [None]
+
+    async def _fetch():
+        try:
+            async with websockets.connect(
+                server_url, ping_interval=30, ping_timeout=10, open_timeout=3, close_timeout=1
+            ) as ws:
+                payload = {"type": "meta_get_guest", "user_id": user_id}
+                if slot is not None:
+                    payload["slot"] = max(1, min(3, int(slot)))
+                await ws.send(json.dumps(payload))
+                async for msg in ws:
+                    try:
+                        data = json.loads(msg)
+                        if data.get("type") == "meta_result":
+                            if "slots" in data:
+                                result[0] = data["slots"]
+                            else:
+                                result[0] = data.get("data")
+                            return
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    def _run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(_fetch())
+        finally:
+            loop.close()
+
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+    th.join(timeout=timeout_sec)
+    return result[0]
+
+
+def push_meta_to_server(slot, data):
+    """Push meta (gems, classes, etc.) to server. Fire-and-forget."""
+    if websockets is None:
+        return
+    server_url = get_server_url()
+    user_id = get_player_name()
+    slot = max(1, min(3, int(slot)))
+
+    async def _push():
+        try:
+            async with websockets.connect(
+                server_url, ping_interval=30, ping_timeout=10, open_timeout=5, close_timeout=2
+            ) as ws:
+                await ws.send(json.dumps({
+                    "type": "meta_set_guest",
+                    "user_id": user_id,
+                    "slot": slot,
+                    "data": data,
+                }))
+                async for _ in ws:
+                    break
+        except Exception:
+            pass
+
+    def _run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(_push())
+        finally:
+            loop.close()
+
+    threading.Thread(target=_run, daemon=True).start()
 
 # Settings (volume, fullscreen, hit_sounds, music, tutorial_completed, difficulty); loaded on startup
 DIFFICULTY_OPTIONS = ("Casual", "Normal", "Hard")
@@ -179,7 +267,7 @@ def get_difficulty_count_mult():
     return 1.0
 
 def load_settings():
-    out = {"volume": 0.7, "fullscreen": True, "hit_sounds": True, "music": True, "tutorial_completed": False, "difficulty": "Normal"}
+    out = {"volume": 0.7, "fullscreen": True, "hit_sounds": True, "music": True, "tutorial_completed": False, "difficulty": "Normal", "player_name": "", "server_url": ""}
     path = get_settings_path()
     data = _load_json_with_backup(path)
     if data:
@@ -191,6 +279,8 @@ def load_settings():
         out["difficulty"] = str(data.get("difficulty", "Normal")).strip() or "Normal"
         if out["difficulty"] not in DIFFICULTY_OPTIONS:
             out["difficulty"] = "Normal"
+        out["player_name"] = str(data.get("player_name", "")).strip()[:64]
+        out["server_url"] = str(data.get("server_url", "")).strip()
     return out
 
 def save_settings():
@@ -585,7 +675,7 @@ class NetClient:
                             self.id = data.get("id")
                             self.last_status = "ONLINE"
                             try:
-                                await ws.send(json.dumps({"type": "identify", "username": str(ONLINE_USERNAME)[:64]}))
+                                await ws.send(json.dumps({"type": "identify", "username": str(get_player_name())[:64]}))
                             except Exception:
                                 pass
                         elif t == "load_result":
@@ -634,7 +724,7 @@ class NetClient:
         if now - self._last_send_ms < 50:  # 20hz
             return
         self._last_send_ms = now
-        payload = {"type":"input","x":float(x),"y":float(y),"weapon":weapon,"name":str(ONLINE_USERNAME)}
+        payload = {"type":"input","x":float(x),"y":float(y),"weapon":weapon,"name":str(get_player_name())}
         try:
             asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(payload)), self._loop)
         except Exception as e:
@@ -661,7 +751,7 @@ class NetClient:
     def send_chat(self, msg: str):
         if not self.connected or self._ws is None or self._loop is None:
             return
-        payload = {"type": "chat", "msg": str(msg)[:160], "name": str(ONLINE_USERNAME)[:16]}
+        payload = {"type": "chat", "msg": str(msg)[:160], "name": str(get_player_name())[:16]}
         try:
             asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(payload)), self._loop)
         except Exception as e:
@@ -875,6 +965,37 @@ async def run_server(host="0.0.0.0", port=8765, tick_hz=20):
                     continue
 
                 t = data.get("type")
+
+                # Gems/meta sync without lobby (user_id from message)
+                if t == "meta_get_guest":
+                    uid = (data.get("user_id") or data.get("name") or "Player").strip()[:64] or "Player"
+                    slot = data.get("slot")
+                    try:
+                        if slot is not None:
+                            slot = max(1, min(3, int(slot)))
+                            out = _db_load(uid, slot, "meta")
+                            await ws.send(json.dumps({"type": "meta_result", "slot": slot, "data": out}))
+                        else:
+                            all_meta = _db_meta_all(uid)
+                            by_slot = {}
+                            for s in (1, 2, 3):
+                                m = all_meta.get(s)
+                                by_slot[s] = m if isinstance(m, dict) else {"gems": 0, "player_class": "No Class", "owned_classes": [], "earned_achievements": [], "daily_completed_date": ""}
+                            await ws.send(json.dumps({"type": "meta_result", "slots": by_slot}))
+                    except Exception as e:
+                        await ws.send(json.dumps({"type": "meta_result", "error": str(e)}))
+                    continue
+                if t == "meta_set_guest":
+                    uid = (data.get("user_id") or data.get("name") or "Player").strip()[:64] or "Player"
+                    slot = max(1, min(3, int(data.get("slot", 1))))
+                    payload = data.get("data")
+                    if isinstance(payload, dict):
+                        try:
+                            _db_save(uid, slot, payload, "meta")
+                            await ws.send(json.dumps({"type": "meta_ok", "slot": slot}))
+                        except Exception as e:
+                            await ws.send(json.dumps({"type": "meta_ok", "slot": slot, "error": str(e)}))
+                    continue
 
                 # Must create or join lobby before any game/save messages
                 if t == "create_lobby":
@@ -2022,12 +2143,13 @@ slot_meta_cache = {1: {"gems":0,"player_class":"No Class"},
                    3: {"gems":0,"player_class":"No Class"}}
 
 def load_slot_meta(slot):
-    """Read meta for menu display. Uses backup recovery so corrupt files don't show 0 gems."""
+    """Read meta for menu display from local file only (no blocking server calls)."""
+    global slot_meta_cache
     slot = int(slot)
+    slot = max(1, min(3, slot))
     path = get_meta_path(slot)
     data = _load_json_with_backup(path)
     if not data:
-        # Fallback: read from run save file if no meta file yet
         run_path = get_save_path(slot)
         data = _load_json_with_backup(run_path)
     if data:
@@ -2035,15 +2157,34 @@ def load_slot_meta(slot):
             "gems": int(data.get("gems", 0)),
             "player_class": str(data.get("player_class", "No Class")),
             "daily_completed_date": str(data.get("daily_completed_date", "")),
+            "owned_classes": data.get("owned_classes", []),
+            "earned_achievements": data.get("earned_achievements", []),
         }
         slot_meta_cache[slot] = meta
         return meta
-    slot_meta_cache[slot] = {"gems": 0, "player_class": "No Class", "daily_completed_date": ""}
+    slot_meta_cache[slot] = {"gems": 0, "player_class": "No Class", "daily_completed_date": "", "owned_classes": [], "earned_achievements": []}
     return slot_meta_cache[slot]
 
 def refresh_all_slot_meta():
+    """Load meta from local files first (instant), then refresh from server in background so gems sync."""
+    global slot_meta_cache
     for s in (1, 2, 3):
         load_slot_meta(s)
+    if get_server_url() and websockets is not None:
+        def _background_refresh():
+            out = fetch_meta_from_server(slot=None, timeout_sec=4)
+            if out and isinstance(out, dict):
+                for s in (1, 2, 3):
+                    m = out.get(s)
+                    if isinstance(m, dict):
+                        slot_meta_cache[s] = {
+                            "gems": int(m.get("gems", 0)),
+                            "player_class": str(m.get("player_class", "No Class")),
+                            "daily_completed_date": str(m.get("daily_completed_date", "")),
+                            "owned_classes": m.get("owned_classes", []),
+                            "earned_achievements": m.get("earned_achievements", []),
+                        }
+        threading.Thread(target=_background_refresh, daemon=True).start()
 
 def confirm_popup(message, yes_text="Yes", no_text="No"):
     """Blocking modal: show message and Yes/No buttons. Returns True if Yes, False if No/Esc."""
@@ -2105,13 +2246,14 @@ def delete_save_slot(slot):
     refresh_all_slot_meta()
 
 def load_meta_into_game():
-    """Load gems, owned_classes, player_class, earned_achievements, daily_completed_date from current slot."""
+    """Load gems, owned_classes, player_class, etc. from current slot. Tries server briefly (2s), then local file."""
     global gems, owned_classes, player_class, earned_achievements, daily_completed_date
-    path = get_meta_path()
-    data = _load_json_with_backup(path)
-    if not data:
-        # Fallback: read from run save so gems/classes persist when meta file wasn't written
-        data = _load_json_with_backup(get_save_path())
+    # Try server with short timeout so we don't freeze; fall back to local
+    data = None
+    if get_server_url():
+        data = fetch_meta_from_server(current_save_slot, timeout_sec=2)
+    if data is None:
+        data = load_slot_meta(current_save_slot)
     if not data:
         return
     try:
@@ -2139,27 +2281,61 @@ def load_meta_into_game():
         pass
 
 def _write_meta_file():
-    """Write current slot's meta file (gems, owned_classes, player_class). Does not raise."""
+    """Write current slot's meta (gems, owned_classes, player_class) to LOCAL file. Then push to server if configured."""
+    global slot_meta_cache
+    # Ensure data dir exists and use absolute path so save always goes to a known place
+    _get_data_dir()
+    meta_path = os.path.abspath(get_meta_path())
+    os.makedirs(os.path.dirname(meta_path), exist_ok=True)
+
+    existing_classes = set()
     try:
-        existing_classes = set()
-        existing = _load_json_with_backup(get_meta_path())
+        existing = _load_json_with_backup(meta_path)
         if existing:
             for c in existing.get("owned_classes", []):
                 if isinstance(c, str) and c.strip():
                     existing_classes.add(c.strip())
-        merged = existing_classes | (owned_classes if owned_classes else {player_class.name})
-        classes_to_save = list(merged)
-        data = {
-            "gems": gems,
-            "owned_classes": classes_to_save,
-            "player_class": player_class.name,
-            "earned_achievements": list(earned_achievements),
-            "daily_completed_date": daily_completed_date,
-        }
-        _atomic_write_json(get_meta_path(), data)
-        load_slot_meta(current_save_slot)
+    except Exception:
+        pass
+    merged = existing_classes | (owned_classes if owned_classes else {player_class.name})
+    classes_to_save = list(merged)
+    data = {
+        "gems": gems,
+        "owned_classes": classes_to_save,
+        "player_class": player_class.name,
+        "earned_achievements": list(earned_achievements),
+        "daily_completed_date": daily_completed_date,
+    }
+
+    # LOCAL SAVE: must succeed for gems to persist
+    local_ok = False
+    try:
+        _atomic_write_json(meta_path, data)
+        local_ok = True
     except Exception as e:
-        print("Meta save failed:", e)
+        print("Meta save failed (local):", e)
+        # Retry once with plain write (no atomic) in case rename failed on same filesystem
+        try:
+            with open(meta_path, "w") as f:
+                json.dump(data, f)
+                f.flush()
+                if hasattr(os, "fsync"):
+                    f.fsync()
+            local_ok = True
+        except Exception as e2:
+            print("Meta save retry failed:", e2)
+
+    if local_ok:
+        slot_meta_cache[current_save_slot] = {
+            "gems": int(data["gems"]),
+            "player_class": str(data["player_class"]),
+            "daily_completed_date": str(data.get("daily_completed_date", "")),
+            "owned_classes": list(data.get("owned_classes", [])),
+            "earned_achievements": list(data.get("earned_achievements", [])),
+        }
+
+    if get_server_url():
+        push_meta_to_server(current_save_slot, data)
 
 def save_meta():
     """Write current slot's meta (used by daily reward). Does not raise."""
@@ -2202,10 +2378,12 @@ def save_game():
         "daily_challenge_active": daily_challenge_active,
         "daily_modifiers": daily_modifiers,
     }
-    # 1. Write run save first so progress is never lost
+    # 1. Write run save first (absolute path so it always works)
     run_ok = False
     try:
-        _atomic_write_json(get_save_path(), run_data)
+        save_path = os.path.abspath(get_save_path())
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        _atomic_write_json(save_path, run_data)
         run_ok = True
     except Exception as e:
         print("Save failed (run):", e)
@@ -2428,7 +2606,7 @@ def reset_game():
     if not ONLINE_ENABLED and online_mode:
         online_mode = False
     if ONLINE_ENABLED and online_mode and websockets is not None:
-        url = os.environ.get("IA_SERVER", "ws://127.0.0.1:8765")
+        url = get_server_url()
         net = NetClient(url)
         net.start()
     else:
@@ -6663,6 +6841,51 @@ def daily_challenge_page():
                     return "start"
         clock.tick(FPS)
 
+def name_entry_screen():
+    """Ask for player name before tutorial (first launch). Saves to settings and returns."""
+    global settings
+    name = (settings.get("player_name") or "").strip()[:24] or ""
+    bar_w = 400
+    bar_h = 48
+    bar_x = WIDTH // 2 - bar_w // 2
+    bar_y = HEIGHT // 2 - 30
+    continue_rect = pygame.Rect(WIDTH // 2 - 80, HEIGHT // 2 + 50, 160, 50)
+    while True:
+        screen.fill(bg_color)
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill(UI_OVERLAY_DARK)
+        screen.blit(overlay, (0, 0))
+        draw_text_centered(FONT_LG, "Welcome", HEIGHT // 2 - 120, UI_TEXT, y_is_center=True)
+        draw_text_centered(FONT_MD, "Enter your name", bar_y - 36, (200, 200, 200))
+        mx, my = pygame.mouse.get_pos()
+        pygame.draw.rect(screen, (50, 50, 50), (bar_x - 2, bar_y - 2, bar_w + 4, bar_h + 4))
+        pygame.draw.rect(screen, (80, 80, 80), (bar_x, bar_y, bar_w, bar_h), 3)
+        prompt = FONT_MD.render(name + ("|" if (pygame.time.get_ticks() // 500) % 2 else ""), True, (240, 240, 240))
+        screen.blit(prompt, (bar_x + 16, bar_y + (bar_h - prompt.get_height()) // 2))
+        draw_button(continue_rect, "Continue", hover=continue_rect.collidepoint(mx, my), text_color=UI_TEXT)
+        pygame.display.flip()
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+            if ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_RETURN or ev.key == pygame.K_KP_ENTER:
+                    settings["player_name"] = (name or "Player").strip()[:24] or "Player"
+                    save_settings()
+                    play_sound("menu_click")
+                    return
+                if ev.key == pygame.K_BACKSPACE:
+                    name = name[:-1]
+                elif ev.unicode and ev.unicode.isprintable() and len(name) < 24:
+                    name += ev.unicode
+            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                if continue_rect.collidepoint(ev.pos):
+                    play_sound("menu_click")
+                    settings["player_name"] = (name or "Player").strip()[:24] or "Player"
+                    save_settings()
+                    return
+        clock.tick(FPS)
+
 def tutorial_screen():
     """First-time tutorial: a few slides, then set tutorial_completed and return."""
     global settings
@@ -6744,13 +6967,15 @@ def main_menu():
         draw_text_centered(FONT_LG, "Infinite Archer", HEIGHT//6, BLACK)
         mx, my = pygame.mouse.get_pos()
 
-        btn_w, btn_h = 360, 70
-        new_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 - 140, btn_w, btn_h)
-        resume_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 - 40, btn_w, btn_h)
-        daily_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 + 60, btn_w, btn_h)
-        online_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 + 110, btn_w, btn_h)
-        quit_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 + 160, btn_w, btn_h)
-        class_rect = pygame.Rect(WIDTH//2 - btn_w//2, HEIGHT//2 + 260, btn_w, btn_h)
+        btn_w, btn_h = 360, 52
+        btn_gap = 36
+        base_y = HEIGHT // 2 - 214
+        new_rect = pygame.Rect(WIDTH//2 - btn_w//2, base_y, btn_w, btn_h)
+        resume_rect = pygame.Rect(WIDTH//2 - btn_w//2, base_y + (btn_gap + btn_h), btn_w, btn_h)
+        daily_rect = pygame.Rect(WIDTH//2 - btn_w//2, base_y + 2 * (btn_gap + btn_h), btn_w, btn_h)
+        online_rect = pygame.Rect(WIDTH//2 - btn_w//2, base_y + 3 * (btn_gap + btn_h), btn_w, btn_h)
+        quit_rect = pygame.Rect(WIDTH//2 - btn_w//2, base_y + 4 * (btn_gap + btn_h), btn_w, btn_h)
+        class_rect = pygame.Rect(WIDTH//2 - btn_w//2, base_y + 5 * (btn_gap + btn_h) + 8, btn_w, btn_h)
 
         for rect, label in [(new_rect, "Create New Game"), (resume_rect, "Resume Game"), (daily_rect, "Daily Challenge"), (online_rect, "Online"), (quit_rect, "Quit")]:
             draw_button(rect, label, hover=rect.collidepoint(mx, my))
@@ -7781,6 +8006,8 @@ if __name__ == "__main__":
         asyncio.run(run_server("0.0.0.0", 8765, 20))
         sys.exit(0)
     reset_game()
+    if not (settings.get("player_name") or "").strip():
+        name_entry_screen()
     if not settings.get("tutorial_completed", False):
         tutorial_screen()
     while True:
